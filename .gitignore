@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project Specific
+simulation_log.csv
+
+# Docker Specific
+docker-compose.override.yml
+.dockerignore

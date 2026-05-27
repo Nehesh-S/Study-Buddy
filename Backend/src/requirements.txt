@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+ultralytics
+influxdb-client
+python-multipart
