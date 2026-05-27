@@ -225,3 +225,17 @@ simulation_log.csv
 # Docker Specific
 docker-compose.override.yml
 .dockerignore
+
+# Simulator Assets
+Microcontrollers/Hardware-Simulator/mock_assets/*
+!Microcontrollers/Hardware-Simulator/mock_assets/.gitkeep
+
+# YOLO Outputs and Temp files
+Backend/src/static/*
+!Backend/src/static/.gitkeep
+temp_*
+
+# macOS
+.DS_Store
+**/.DS_Store
+*/yolov*

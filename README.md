@@ -10,15 +10,22 @@ The **Study Buddy** is an IoT-based productivity and focus monitoring system. It
 * [Docker Desktop](https://www.docker.com/products/docker-desktop/) and Docker Compose
 * Python 3.10+ and [uv](https://github.com/astral-sh/uv) (for running the local simulator)
 
-### Start the Infrastructure (Backend, Database, Dashboard)
-Navigate to the Docker directory and spin up the containers:
+### 1. Start the Databases (Docker)
+To keep things clean, we run InfluxDB and Grafana inside Docker containers:
 ```bash
 cd Backend/Docker
-docker-compose up -d --build
+docker-compose up -d influxdb grafana
 ```
 
-### Run the Hardware Simulator
-If you don't have physical hardware, run the Python simulator to populate the dashboard with data from both the ESP8266 and ESP32:
+### 2. Start the AI Backend (Native)
+To squeeze maximum performance out of your Apple Silicon or local GPU for the heavy YOLOv8 Large model, run the backend natively outside of Docker:
+```bash
+cd Backend
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000
+```
+
+### 3. Run the Hardware Simulator
+If you don't have physical hardware, run the Python simulator to send mocked sensor data and camera images to the backend:
 ```bash
 cd Microcontrollers/Hardware-Simulator
 uv run simulate_hardware.py

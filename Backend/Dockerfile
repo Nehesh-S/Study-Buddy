@@ -1,6 +1,8 @@
 # Use the official ultra-fast uv image
 FROM ghcr.io/astral-sh/uv:python3.10-bookworm-slim
 
+RUN apt-get update && apt-get install -y libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Place the virtual environment outside of /app so it doesn't get overwritten 
