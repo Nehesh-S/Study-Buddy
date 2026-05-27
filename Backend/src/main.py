@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
+from typing import Optional
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 import random
@@ -15,7 +16,7 @@ class SensorData(BaseModel):
     button_pressed: bool
 
 @app.post("/api/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(image: UploadFile = File(...), audio: Optional[UploadFile] = File(None)):
     global latest_yolo_state
     # Dummy logic: randomly updates state
     latest_yolo_state = random.choice(["distracted", "working"])

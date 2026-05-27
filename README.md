@@ -18,10 +18,10 @@ docker-compose up -d --build
 ```
 
 ### Run the Hardware Simulator
-If you don't have physical hardware, run the Python simulator to populate the dashboard with data:
+If you don't have physical hardware, run the Python simulator to populate the dashboard with data from both the ESP8266 and ESP32:
 ```bash
-cd Microcontrollers/Simulator
-uv run dummy_esp8266.py
+cd Microcontrollers/Hardware-Simulator
+uv run simulate_hardware.py
 ```
 
 ### Stop / Reset Data
@@ -82,13 +82,15 @@ All hardware traffic flows into the backend via standard HTTP POST requests on p
 }
 ```
 
-### Camera Inference (YOLO)
+### Camera & Microphone Inference (ESP32)
 * **Endpoint:** `POST http://<SERVER_IP>:8000/api/predict`
 * **Content-Type:** `multipart/form-data`
-* **Description:** Receives an image from the camera to run through YOLO to detect distraction.
+* **Description:** Receives an image and optional audio from the ESP32 to detect distraction.
 
 **Request Payload:**
-Send the image as a standard form-data file upload under the key `file`.
+Send standard form-data file uploads under the keys:
+* `image` (Required: `.jpg` / `.png`)
+* `audio` (Optional: `.wav`)
 
 **Response Payload:**
 ```json
