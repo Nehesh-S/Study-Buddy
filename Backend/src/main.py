@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request # Removed UploadFile, File
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from influxdb_client import InfluxDBClient, Point
