@@ -1,14 +1,12 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, Request # Removed UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 from ultralytics import YOLO
 import random
 import time
 import os
-import shutil
 
 app = FastAPI()
 
@@ -27,13 +25,26 @@ class SensorData(BaseModel):
     button_pressed: bool
 
 @app.post("/api/predict")
-async def predict(image: UploadFile = File(...), audio: Optional[UploadFile] = File(None)):
+async def predict(request: Request):
     global latest_yolo_state
+
+    # 1. Grab the decibel value from the headers (defaults to 0 if missing)
+    noise_str = request.headers.get("Noise-Level", "0")
+    noise_db = float(noise_str)
     
-    # Save the incoming image to process
-    temp_path = f"temp_{image.filename}"
+    print(f"Received noise level: {noise_db} dB")
+
+    # 1. Read the raw binary bytes from the POST body
+    image_data = await request.body()
+    
+    if not image_data:
+        return {"status": "error", "message": "No image data received"}
+    
+    # 2. Save the incoming raw bytes to process
+    # Using a timestamp ensures unique temp files if requests overlap
+    temp_path = f"temp_{int(time.time())}.jpg"
     with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(image.file, buffer)
+        buffer.write(image_data)
         
     try:
         # Run YOLO inference
@@ -69,7 +80,8 @@ async def predict(image: UploadFile = File(...), audio: Optional[UploadFile] = F
         point = Point("camera") \
             .field("image_url", image_url) \
             .field("state", latest_yolo_state) \
-            .field("state_code", 1 if latest_yolo_state == "working" else 0)
+            .field("state_code", 1 if latest_yolo_state == "working" else 0) \
+            .field("noise_db", noise_db)
             
         write_api.write(bucket="sensors", org="myorg", record=point)
         client.close()
