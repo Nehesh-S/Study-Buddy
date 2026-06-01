@@ -52,13 +52,16 @@ async def predict(request: Request):
         
         # Basic state logic based on detected classes
         detections = [model.names[int(c)] for c in results[0].boxes.cls]
+        person_count = detections.count("person")
         
         if "cell phone" in detections:
             latest_yolo_state = "distracted"
-        elif "person" in detections:
+        elif person_count > 1:
+            latest_yolo_state = "distracted"
+        elif person_count == 1:
             latest_yolo_state = "working"
         else:
-            latest_yolo_state = "distracted" # Empty desk
+            latest_yolo_state = "away" # No person detected
             
         # Save the YOLO annotated image
         output_filename = "latest_detection.jpg"
@@ -77,10 +80,13 @@ async def predict(request: Request):
         ts = int(time.time())
         image_url = f"http://localhost:8000/static/{output_filename}?ts={ts}"
         
+        # Map states to integers: 1 (Working), 0 (Distracted), 2 (Away)
+        state_int = 1 if latest_yolo_state == "working" else (0 if latest_yolo_state == "distracted" else 2)
+        
         point = Point("camera") \
             .field("image_url", image_url) \
             .field("state", latest_yolo_state) \
-            .field("state_code", 1 if latest_yolo_state == "working" else 0) \
+            .field("state_code", state_int) \
             .field("noise_db", noise_db)
             
         write_api.write(bucket="sensors", org="myorg", record=point)
