@@ -4,26 +4,78 @@
 #include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
 #include <Arduino_JSON.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 const char* ssid = "laptop";
 const char* password = "0987654321";
 
 const char* serverName = "http://192.168.137.90:8000/api/esp8266-sync";
 
-// Pin configuration and sensor type
-#define DHTPIN 2        // GPIO pin connected to DHT22
-#define DHTTYPE DHT22   // Specify DHT22 sensor
-
+#define DHTPIN 2
+#define DHTTYPE DHT22
 #define LDRPIN A0
+
+#define BUTTON_PIN 13
+
+#define TIMER_PRESET (5UL * 60UL * 1000UL)  // 5 minutes in milliseconds
+#define DEBOUNCE_DELAY 50
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+#define OLED_SDA 4
+#define OLED_SCL 5
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 unsigned long lastTime = 0;
 unsigned long timerDelay = 5000;
 
+bool timerRunning = false;
+unsigned long timerStartMillis = 0;
+bool buttonPressed = false;
+
+int lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+
 DHT dht(DHTPIN, DHTTYPE);
 
+void updateDisplay(unsigned long timerSeconds, bool running) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(running ? "TIMER RUNNING" : "TIMER IDLE");
+
+  display.setTextSize(3);
+  display.setCursor(10, 24);
+  unsigned long mins = timerSeconds / 60;
+  unsigned long secs = timerSeconds % 60;
+  if (mins < 10) display.print("0");
+  display.print(mins);
+  display.print(":");
+  if (secs < 10) display.print("0");
+  display.print(secs);
+
+  display.display();
+}
+
 void setup() {
-  Serial.begin(115200);   // Start serial communication for debugging
-  dht.begin();          // Initialize the DHT sensor
+  Serial.begin(115200);
+  dht.begin();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 init failed");
+  } else {
+    display.clearDisplay();
+    display.display();
+  }
 
   WiFi.begin(ssid, password);
   Serial.println("Connecting");
@@ -37,7 +89,38 @@ void setup() {
 }
 
 void loop() {
-  delay(2000);  // Delay for sensor stability (DHT22 polling rate)
+  // Debounced button read
+  int reading = digitalRead(BUTTON_PIN);
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY && reading == LOW) {
+    if (!buttonPressed || !timerRunning) {
+      timerRunning = true;
+      timerStartMillis = millis();
+      buttonPressed = true;
+      Serial.println("Button pressed — timer started");
+    }
+  }
+  lastButtonState = reading;
+
+  // Calculate remaining timer seconds
+  unsigned long timerRemaining = TIMER_PRESET;
+  if (timerRunning) {
+    unsigned long elapsed = millis() - timerStartMillis;
+    if (elapsed >= TIMER_PRESET) {
+      timerRemaining = 0;
+      timerRunning = false;
+      Serial.println("Timer finished");
+    } else {
+      timerRemaining = TIMER_PRESET - elapsed;
+    }
+  }
+  unsigned long timerSeconds = timerRemaining / 1000;
+
+  updateDisplay(timerSeconds, timerRunning);
+
+  delay(2000);  // DHT22 polling rate
 
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
@@ -46,78 +129,48 @@ void loop() {
   // float RLDR = (10000.0 * (3.3 - Vout)) / Vout;
   // int lux = 500 / (RLDR / 1000);
 
-  //Send an HTTP POST request every 10 minutes
   if ((millis() - lastTime) > timerDelay) {
-    //Check WiFi connection status
-    if(WiFi.status()== WL_CONNECTED){
+    if (WiFi.status() == WL_CONNECTED) {
       WiFiClient client;
       HTTPClient http;
-      
-      // Your Domain name with URL path or IP address with path
+
       http.begin(client, serverName);
-  
-      // If you need Node-RED/server authentication, insert user and password below
-      //http.setAuthorization("REPLACE_WITH_SERVER_USERNAME", "REPLACE_WITH_SERVER_PASSWORD");
-  
-      // Specify content-type header
       http.addHeader("Content-Type", "application/json");
-       // Create JSON data
-      // String jsonData = "{";
-      // jsonData += "\"humidity\":" + String(humidity) + ",";
-      // jsonData += "\"temperature\":" + String(temperature) + ",";
-      // jsonData += "\"timer_value\":" + String(69) + ",";
-      // jsonData += "\"ldr_value\":" + String(69) + ",";
-      // jsonData += "\"button_pressed\":" + String(0) + ",";
-      // jsonData += "}";      
 
       JSONVar doc;
       doc["humidity"] = humidity;
       doc["temperature"] = temperature;
-      doc["timer_value"] = 69;
+      doc["timer_value"] = (int)timerSeconds;
       doc["ldr_value"] = ldr;
-      doc["button_pressed"] = true;
+      doc["button_pressed"] = buttonPressed;
 
       String jsonBody = JSON.stringify(doc);
 
-
-      // Send HTTP POST request
       int httpResponseCode = http.POST(jsonBody);
-      
-      // If you need an HTTP request with a content type: application/json, use the following:
-      //http.addHeader("Content-Type", "application/json");
-      //int httpResponseCode = http.POST("{\"api_key\":\"tPmAT5Ab3j7F9\",\"sensor\":\"BME280\",\"value1\":\"24.25\",\"value2\":\"49.54\",\"value3\":\"1005.14\"}");
-
-      // If you need an HTTP request with a content type: text/plain
-      //http.addHeader("Content-Type", "text/plain");
-      //int httpResponseCode = http.POST("Hello, World!");
-     
       Serial.print("HTTP Response code: ");
       Serial.println(httpResponseCode);
-        
-      // Free resources
+
       http.end();
-    }
-    else {
+
+      buttonPressed = false;  // reset after each send
+    } else {
       Serial.println("WiFi Disconnected");
     }
     lastTime = millis();
   }
-  
 
-  // Error handling if sensor fails to provide data
   if (isnan(humidity) || isnan(temperature)) {
     Serial.println("Error: Unable to read data from DHT sensor.");
     return;
   }
 
-  // Print the results to the serial monitor
   Serial.print("Humidity: ");
   Serial.print(humidity);
-  Serial.print(" %\t");
-  Serial.print("Temperature: ");
+  Serial.print(" %\t Temperature: ");
   Serial.print(temperature);
-  Serial.println(" °C");
-  Serial.print(" %\t");
-  Serial.print("LDR: ");
-  Serial.println(ldr);
+  Serial.print(" °C\t LDR: ");
+  Serial.print(ldr);
+  Serial.print("\t Timer: ");
+  Serial.print(timerSeconds);
+  Serial.println("s");
 }
