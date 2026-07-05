@@ -17,11 +17,17 @@ const char* serverName = "http://192.168.137.201:8000/api/esp8266-sync";
 
 #define DHTPIN 2      //D4
 #define DHTTYPE DHT22
-#define LDRPIN A0
 
-#define TOUCH_PIN 13 //D7
+#define LDR_PIN 14    //D5  — digital light/dark (HIGH = bright, LOW = dark)
+#define POT_PIN A0    //     — potentiometer wiper (only ADC on the ESP8266)
 
-#define TIMER_PRESET (1UL * 60UL * 1000UL)  // 5 minutes in milliseconds
+#define TOUCH1_PIN 13 //D7  — start focus timer / stop the cycle
+#define TOUCH2_PIN 12 //D6  — cycle set mode (focus -> break -> idle)
+
+// Timer configuration
+#define MIN_MINUTES 1
+#define MAX_MINUTES 10
+#define DEFAULT_MINUTES 1
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -31,9 +37,10 @@ const char* serverName = "http://192.168.137.201:8000/api/esp8266-sync";
 
 // Event cadences (milliseconds)
 #define TOUCH_POLL_INTERVAL 20
+#define UI_INTERVAL 200
 #define SENSOR_READ_INTERVAL 2000
-#define DISPLAY_INTERVAL 1000
 #define SYNC_INTERVAL 5000
+#define WIFI_MONITOR_INTERVAL 500
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 DHT dht(DHTPIN, DHTTYPE);
@@ -48,25 +55,55 @@ wl_status_t lastWifiStatus = WL_IDLE_STATUS;
 // by the display and sync events.
 float humidity = 0.0;
 float temperature = 0.0;
-int ldrValue = 0;
+int ldrValue = 0;  // 1 = bright, 0 = dark
 
-// Timer state
-bool timerRunning = false;
-unsigned long timerStartMillis = 0;
-bool touchDetected = false;
-int lastTouchState = LOW;
+// --- Study Buddy timer state ----------------------------------------------
 
-// Remaining timer value (seconds), maintained by the display event and
-// reported by the sync event.
-unsigned long currentTimerSeconds = TIMER_PRESET / 1000;
+enum Mode {
+  MODE_IDLE,       // stopped; shows the configured focus time
+  MODE_FOCUS,      // focus timer counting down
+  MODE_BREAK,      // break timer counting down
+  MODE_SET_FOCUS,  // pot sets the focus duration
+  MODE_SET_BREAK   // pot sets the break duration
+};
 
-void updateDisplay(unsigned long timerSeconds, bool running) {
+Mode mode = MODE_IDLE;
+
+int focusMinutes = DEFAULT_MINUTES;
+int breakMinutes = DEFAULT_MINUTES;
+
+unsigned long phaseStartMillis = 0;              // when the running phase began
+unsigned long currentTimerSeconds = DEFAULT_MINUTES * 60UL;  // shown + synced value
+
+// Touch edge-detection (TTP223 drives the line HIGH while touched).
+int lastTouch1State = LOW;
+int lastTouch2State = LOW;
+
+bool touchDetected = false;  // sensor-1 touched since last sync (telemetry)
+
+unsigned long focusDurationMs() { return (unsigned long)focusMinutes * 60UL * 1000UL; }
+unsigned long breakDurationMs() { return (unsigned long)breakMinutes * 60UL * 1000UL; }
+
+// Remaining whole seconds in the running phase, clamped so it never underflows.
+unsigned long remainingSeconds(unsigned long durationMs) {
+  unsigned long elapsed = millis() - phaseStartMillis;
+  if (elapsed >= durationMs) return 0;
+  return (durationMs - elapsed) / 1000;
+}
+
+// Map the potentiometer to a whole number of minutes in [MIN, MAX].
+int readPotMinutes() {
+  int raw = analogRead(POT_PIN);
+  return constrain(map(raw, 0, 1023, MIN_MINUTES, MAX_MINUTES), MIN_MINUTES, MAX_MINUTES);
+}
+
+void updateDisplay(const char* label, unsigned long timerSeconds) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print(running ? "TIMER RUNNING" : "TIMER IDLE");
+  display.print(label);
 
   display.setTextSize(3);
   display.setCursor(10, 24);
@@ -83,23 +120,102 @@ void updateDisplay(unsigned long timerSeconds, bool running) {
 
 // --- Events ---------------------------------------------------------------
 
-// Watch the capacitive touch pad and start the timer on a fresh touch.
-void checkTouch() {
-  int touchState = digitalRead(TOUCH_PIN);
-  if (touchState == HIGH && lastTouchState == LOW) {  // rising edge = new touch
-    timerRunning = true;
-    timerStartMillis = millis();
+// Touch 1: start the focus cycle from idle, or stop it back to idle.
+void checkTouch1() {
+  int s = digitalRead(TOUCH1_PIN);
+  if (s == HIGH && lastTouch1State == LOW) {  // rising edge = new touch
     touchDetected = true;
-    Serial.println("Touch detected — timer started");
+    if (mode == MODE_IDLE) {
+      mode = MODE_FOCUS;
+      phaseStartMillis = millis();
+      Serial.println("Touch 1 — focus timer started");
+    } else if (mode == MODE_FOCUS || mode == MODE_BREAK) {
+      mode = MODE_IDLE;  // stop the cycle and return to idle
+      Serial.println("Touch 1 — cycle stopped, idle");
+    }
+    // In set mode Touch 1 is ignored; use Touch 2 to finish setting.
   }
-  lastTouchState = touchState;
+  lastTouch1State = s;
 }
 
-// Read the DHT22 and LDR. Keeps the last good values if the DHT read fails.
+// Touch 2: cycle through the set-mode screens (focus -> break -> idle).
+void checkTouch2() {
+  int s = digitalRead(TOUCH2_PIN);
+  if (s == HIGH && lastTouch2State == LOW) {  // rising edge = new touch
+    if (mode == MODE_SET_FOCUS) {
+      mode = MODE_SET_BREAK;
+      Serial.println("Touch 2 — setting BREAK timer");
+    } else if (mode == MODE_SET_BREAK) {
+      mode = MODE_IDLE;
+      Serial.print("Touch 2 — saved. Focus=");
+      Serial.print(focusMinutes);
+      Serial.print("min Break=");
+      Serial.print(breakMinutes);
+      Serial.println("min");
+    } else {  // from idle or a running phase, enter set mode
+      mode = MODE_SET_FOCUS;
+      Serial.println("Touch 2 — setting FOCUS timer");
+    }
+  }
+  lastTouch2State = s;
+}
+
+// Advance the focus/break cycle, apply the pot in set mode, and repaint.
+void updateUI() {
+  // 1) Advance the running phases; when one ends, the other starts automatically.
+  if (mode == MODE_FOCUS && millis() - phaseStartMillis >= focusDurationMs()) {
+    mode = MODE_BREAK;
+    phaseStartMillis = millis();
+    Serial.println("Focus finished — break started");
+  } else if (mode == MODE_BREAK && millis() - phaseStartMillis >= breakDurationMs()) {
+    mode = MODE_FOCUS;
+    phaseStartMillis = millis();
+    Serial.println("Break finished — focus started");
+  }
+
+  // 2) In set mode the value snaps to the potentiometer position.
+  if (mode == MODE_SET_FOCUS) {
+    focusMinutes = readPotMinutes();
+  } else if (mode == MODE_SET_BREAK) {
+    breakMinutes = readPotMinutes();
+  }
+
+  // 3) Decide what to show.
+  const char* label;
+  unsigned long showSeconds;
+  switch (mode) {
+    case MODE_FOCUS:
+      label = "FOCUS";
+      showSeconds = remainingSeconds(focusDurationMs());
+      break;
+    case MODE_BREAK:
+      label = "BREAK";
+      showSeconds = remainingSeconds(breakDurationMs());
+      break;
+    case MODE_SET_FOCUS:
+      label = "SET FOCUS";
+      showSeconds = focusMinutes * 60UL;
+      break;
+    case MODE_SET_BREAK:
+      label = "SET BREAK";
+      showSeconds = breakMinutes * 60UL;
+      break;
+    case MODE_IDLE:
+    default:
+      label = "READY";
+      showSeconds = focusMinutes * 60UL;
+      break;
+  }
+
+  currentTimerSeconds = showSeconds;
+  updateDisplay(label, showSeconds);
+}
+
+// Read the DHT22 and the digital LDR. Keeps last good DHT values on a failed read.
 void readSensors() {
   float h = dht.readHumidity();
   float t = dht.readTemperature();
-  ldrValue = analogRead(LDRPIN);
+  ldrValue = digitalRead(LDR_PIN);  // HIGH = bright, LOW = dark
 
   if (isnan(h) || isnan(t)) {
     Serial.println("Error: Unable to read data from DHT sensor.");
@@ -112,25 +228,8 @@ void readSensors() {
   Serial.print(humidity);
   Serial.print(" %\t Temperature: ");
   Serial.print(temperature);
-  Serial.print(" °C\t LDR: ");
-  Serial.println(ldrValue);
-}
-
-// Advance the countdown and repaint the OLED once per second.
-void refreshDisplay() {
-  unsigned long remaining = TIMER_PRESET;
-  if (timerRunning) {
-    unsigned long elapsed = millis() - timerStartMillis;
-    if (elapsed >= TIMER_PRESET) {
-      remaining = 0;
-      timerRunning = false;
-      Serial.println("Timer finished");
-    } else {
-      remaining = TIMER_PRESET - elapsed;
-    }
-  }
-  currentTimerSeconds = remaining / 1000;
-  updateDisplay(currentTimerSeconds, timerRunning);
+  Serial.print(" °C\t Light: ");
+  Serial.println(ldrValue ? "bright" : "dark");
 }
 
 // Fires as the async request progresses; readyState 4 means the exchange is done.
@@ -193,7 +292,9 @@ void setup() {
   Serial.begin(115200);
   dht.begin();
 
-  pinMode(TOUCH_PIN, INPUT);  // TTP223 actively drives the line
+  pinMode(TOUCH1_PIN, INPUT);  // TTP223 actively drives the line
+  pinMode(TOUCH2_PIN, INPUT);
+  pinMode(LDR_PIN, INPUT);     // divider node drives the pin; no pull-up
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -215,11 +316,12 @@ void setup() {
   request.onReadyStateChange(onRequestComplete);
 
   // Register the asynchronous events.
-  app.onRepeat(TOUCH_POLL_INTERVAL, checkTouch);
+  app.onRepeat(TOUCH_POLL_INTERVAL, checkTouch1);
+  app.onRepeat(TOUCH_POLL_INTERVAL, checkTouch2);
+  app.onRepeat(UI_INTERVAL, updateUI);
   app.onRepeat(SENSOR_READ_INTERVAL, readSensors);
-  app.onRepeat(DISPLAY_INTERVAL, refreshDisplay);
   app.onRepeat(SYNC_INTERVAL, syncToServer);
-  app.onRepeat(500, monitorWiFi);
+  app.onRepeat(WIFI_MONITOR_INTERVAL, monitorWiFi);
 }
 
 void loop() {
