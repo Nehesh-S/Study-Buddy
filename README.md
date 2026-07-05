@@ -91,13 +91,14 @@ All hardware traffic flows into the backend via standard HTTP POST requests on p
 
 ### Camera & Microphone Inference (ESP32)
 * **Endpoint:** `POST http://<SERVER_IP>:8000/api/predict`
-* **Content-Type:** `multipart/form-data`
-* **Description:** Receives an image and optional audio from the ESP32 to detect distraction.
+* **Content-Type:** `image/jpeg` (or raw binary)
+* **Description:** Receives raw image bytes via the POST body and ambient noise via HTTP headers.
+
+**Request Headers:**
+* `Noise-Level` (Optional): The ambient noise in decibels (e.g., "45.5")
 
 **Request Payload:**
-Send standard form-data file uploads under the keys:
-* `image` (Required: `.jpg` / `.png`)
-* `audio` (Optional: `.wav`)
+Send the raw binary bytes of the `.jpg` image directly in the request body.
 
 **Response Payload:**
 ```json
