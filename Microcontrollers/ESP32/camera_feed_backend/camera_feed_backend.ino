@@ -18,7 +18,7 @@ const char* ssid = "laptop";
 const char* password = "0987654321";
 
 // Server endpoint
-const char* serverUrl = "http://192.168.137.90:8000/api/predict";
+const char* serverUrl = "http://192.168.137.201:8000/api/predict";
 
 // Define camera model & pinout
 #define CAMERA_MODEL_XIAO_ESP32S3  // Has PSRAM

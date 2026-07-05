@@ -11,22 +11,22 @@
 const char* ssid = "laptop";
 const char* password = "0987654321";
 
-const char* serverName = "http://192.168.137.90:8000/api/esp8266-sync";
+const char* serverName = "http://192.168.137.201:8000/api/esp8266-sync";
 
-#define DHTPIN 2
+#define DHTPIN 2      //D4
 #define DHTTYPE DHT22
 #define LDRPIN A0
 
-#define BUTTON_PIN 13
+#define BUTTON_PIN 13 //D7
 
-#define TIMER_PRESET (5UL * 60UL * 1000UL)  // 5 minutes in milliseconds
+#define TIMER_PRESET (1UL * 60UL * 1000UL)  // 5 minutes in milliseconds
 #define DEBOUNCE_DELAY 50
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_ADDR 0x3C
-#define OLED_SDA 4
-#define OLED_SCL 5
+#define OLED_SDA 4  //D2
+#define OLED_SCL 5  //D1
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
