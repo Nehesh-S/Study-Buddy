@@ -9,15 +9,24 @@ OLED Display:
     SCL -> D1
     SDA -> D2
 
-LDR:
-    Pin 1 -> A0
-    Pin 2 -> 3V3
+LDR (digital light/dark, RC divider into a digital pin):
+    LDR Pin 1      -> 3V3
+    LDR Pin 2      -> D5   (junction node, read as digital HIGH=bright / LOW=dark)
+    Resistor Pin 1 -> D5   (same junction node)
+    Resistor Pin 2 -> GND
+    // NOTE: moved off A0 so the potentiometer can use the ESP8266's only ADC.
 
-Resistor:
-    Pin 1 -> A0
-    Pin 2 -> GND
+Potentiometer (analog, sets the timer values):
+    Pin 1 (end)   -> 3V3
+    Pin 2 (wiper) -> A0    // moved here from D8: A0 is the only analog input
+    Pin 3 (end)   -> GND
 
-Touch Sensor 1 (TTP223):    // For starting the timer
-    VCC => 3V3
+Touch Sensor 1 (TTP223):    // Start focus timer / stop the cycle
+    VCC -> 3V3
     I/O -> D7
+    GND -> GND
+
+Touch Sensor 2 (TTP223):    // Enter/cycle set mode (focus -> break -> idle)
+    VCC -> 3V3
+    I/O -> D6    // moved off D3 (GPIO0) which is a boot-strapping pin
     GND -> GND
