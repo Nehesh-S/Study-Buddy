@@ -17,10 +17,9 @@ const char* serverName = "http://192.168.137.201:8000/api/esp8266-sync";
 #define DHTTYPE DHT22
 #define LDRPIN A0
 
-#define BUTTON_PIN 13 //D7
+#define TOUCH_PIN 13 //D7
 
 #define TIMER_PRESET (1UL * 60UL * 1000UL)  // 5 minutes in milliseconds
-#define DEBOUNCE_DELAY 50
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -35,10 +34,9 @@ unsigned long timerDelay = 5000;
 
 bool timerRunning = false;
 unsigned long timerStartMillis = 0;
-bool buttonPressed = false;
+bool touchDetected = false;
 
-int lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
+int lastTouchState = LOW;
 
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -67,7 +65,7 @@ void setup() {
   Serial.begin(115200);
   dht.begin();
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TOUCH_PIN, INPUT);  // TTP223 actively drives the line, no pull-up needed
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -89,20 +87,15 @@ void setup() {
 }
 
 void loop() {
-  // Debounced button read
-  int reading = digitalRead(BUTTON_PIN);
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
+  // Capacitive touch read (TTP223 outputs HIGH while touched)
+  int touchState = digitalRead(TOUCH_PIN);
+  if (touchState == HIGH && lastTouchState == LOW) {  // rising edge = new touch
+    timerRunning = true;
+    timerStartMillis = millis();
+    touchDetected = true;
+    Serial.println("Touch detected — timer started");
   }
-  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY && reading == LOW) {
-    if (!buttonPressed || !timerRunning) {
-      timerRunning = true;
-      timerStartMillis = millis();
-      buttonPressed = true;
-      Serial.println("Button pressed — timer started");
-    }
-  }
-  lastButtonState = reading;
+  lastTouchState = touchState;
 
   // Calculate remaining timer seconds
   unsigned long timerRemaining = TIMER_PRESET;
@@ -142,7 +135,7 @@ void loop() {
       doc["temperature"] = temperature;
       doc["timer_value"] = (int)timerSeconds;
       doc["ldr_value"] = ldr;
-      doc["button_pressed"] = buttonPressed;
+      doc["button_pressed"] = touchDetected;
 
       String jsonBody = JSON.stringify(doc);
 
@@ -152,7 +145,7 @@ void loop() {
 
       http.end();
 
-      buttonPressed = false;  // reset after each send
+      touchDetected = false;  // reset after each send
     } else {
       Serial.println("WiFi Disconnected");
     }

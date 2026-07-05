@@ -17,6 +17,7 @@ Resistor:
     Pin 1 -> A0
     Pin 2 -> GND
 
-Push Button: (To be replaced by capacitive touch sensor)
-    Base Pin 1 -> D7
-    Base Pin 2 -> GND
+Touch Sensor 1 (TTP223):    // For starting the timer
+    VCC => 3V3
+    I/O -> D7
+    GND -> GND
