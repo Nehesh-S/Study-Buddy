@@ -1,19 +1,30 @@
 #include <Arduino.h>
 #include <DHT.h>
 #include <ESP8266WiFi.h>
+#include <WiFiClient.h>
 #include <Arduino_JSON.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ReactESP.h>
-#include <AsyncHTTPRequest_Generic.h>  // pulls in ESPAsyncTCP on ESP8266
 
 using namespace reactesp;
+
+// HTTP sync uses a raw WiFiClient (stable lwIP sockets), NOT the async
+// ESPAsyncTCP stack — that stack null-derefs in its error handler on the ESP8266
+// when a connection fails and hard-crashes the chip. We block only on connect()
+// (bounded by CONNECT_TIMEOUT_MS); sending the request and reading the reply are
+// done without blocking the loop (see syncToServer / pollSyncResponse).
+#define CONNECT_TIMEOUT_MS 1000   // max blocking time while establishing the TCP connection
+#define RESPONSE_TIMEOUT_MS 3000  // give up waiting for the reply after this (non-blocking)
 
 const char* ssid = "laptop";
 const char* password = "0987654321";
 
-const char* serverName = "http://192.168.137.201:8000/api/esp8266-sync";
+// Backend split into host/port/path so we can drive a raw socket ourselves.
+const char* serverHost = "192.168.137.201";
+const uint16_t serverPort = 8000;
+const char* serverPath = "/api/esp8266-sync";
 
 #define DHTPIN 2      //D4
 #define DHTTYPE DHT22
@@ -40,13 +51,25 @@ const char* serverName = "http://192.168.137.201:8000/api/esp8266-sync";
 #define UI_INTERVAL 200
 #define SENSOR_READ_INTERVAL 2000
 #define SYNC_INTERVAL 5000
+#define SYNC_POLL_INTERVAL 50
 #define WIFI_MONITOR_INTERVAL 500
+
+// A touch must read HIGH for this many consecutive polls (~60 ms) to count.
+// Rejects brief glitches — e.g. TTP223 output blips when WiFi transmit spikes
+// the supply — that a raw single-sample edge would wrongly accept as a touch.
+#define TOUCH_CONFIRM_SAMPLES 3
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 DHT dht(DHTPIN, DHTTYPE);
 
 ReactESP app;  // ReactESP 2.x — v3 dropped ESP8266 support (requires FreeRTOS)
-AsyncHTTPRequest request;
+
+// Reused socket for the backend sync + its non-blocking response state.
+WiFiClient syncClient;
+enum SyncState { SYNC_IDLE, SYNC_WAITING };  // WAITING = request sent, reply pending
+SyncState syncState = SYNC_IDLE;
+unsigned long syncSentAt = 0;
+String syncStatusLine;  // accumulates the HTTP status line as bytes trickle in
 
 // Tracks WiFi connection state so we can log transitions without blocking.
 wl_status_t lastWifiStatus = WL_IDLE_STATUS;
@@ -75,9 +98,11 @@ int breakMinutes = DEFAULT_MINUTES;
 unsigned long phaseStartMillis = 0;              // when the running phase began
 unsigned long currentTimerSeconds = DEFAULT_MINUTES * 60UL;  // shown + synced value
 
-// Touch edge-detection (TTP223 drives the line HIGH while touched).
-int lastTouch1State = LOW;
-int lastTouch2State = LOW;
+// Touch confirmation state (TTP223 drives the line HIGH while touched).
+int touch1Count = 0;
+bool touch1Latched = false;
+int touch2Count = 0;
+bool touch2Latched = false;
 
 bool touchDetected = false;  // sensor-1 touched since last sync (telemetry)
 
@@ -120,44 +145,59 @@ void updateDisplay(const char* label, unsigned long timerSeconds) {
 
 // --- Events ---------------------------------------------------------------
 
+// Confirmed rising-edge: returns true once per press, after the line has been
+// HIGH for TOUCH_CONFIRM_SAMPLES consecutive polls. A single-sample glitch
+// never reaches the threshold, so it is ignored.
+bool touchPressed(uint8_t pin, int& stableCount, bool& latched) {
+  if (digitalRead(pin) == HIGH) {
+    if (stableCount < TOUCH_CONFIRM_SAMPLES) stableCount++;
+    if (stableCount >= TOUCH_CONFIRM_SAMPLES && !latched) {
+      latched = true;  // fire once; stays latched until released
+      return true;
+    }
+  } else {
+    stableCount = 0;
+    latched = false;  // released — arm for the next press
+  }
+  return false;
+}
+
 // Touch 1: start the focus cycle from idle, or stop it back to idle.
 void checkTouch1() {
-  int s = digitalRead(TOUCH1_PIN);
-  if (s == HIGH && lastTouch1State == LOW) {  // rising edge = new touch
-    touchDetected = true;
-    if (mode == MODE_IDLE) {
-      mode = MODE_FOCUS;
-      phaseStartMillis = millis();
-      Serial.println("Touch 1 — focus timer started");
-    } else if (mode == MODE_FOCUS || mode == MODE_BREAK) {
-      mode = MODE_IDLE;  // stop the cycle and return to idle
-      Serial.println("Touch 1 — cycle stopped, idle");
-    }
-    // In set mode Touch 1 is ignored; use Touch 2 to finish setting.
+  if (!touchPressed(TOUCH1_PIN, touch1Count, touch1Latched)) return;
+
+  touchDetected = true;
+  if (mode == MODE_IDLE) {
+    mode = MODE_FOCUS;
+    phaseStartMillis = millis();
+    Serial.println("Touch 1 — focus timer started");
+  } else if (mode == MODE_FOCUS || mode == MODE_BREAK) {
+    mode = MODE_IDLE;  // stop the cycle and return to idle
+    Serial.println("Touch 1 — cycle stopped, idle");
   }
-  lastTouch1State = s;
+  // In set mode Touch 1 is ignored; use Touch 2 to finish setting.
 }
 
 // Touch 2: cycle through the set-mode screens (focus -> break -> idle).
 void checkTouch2() {
-  int s = digitalRead(TOUCH2_PIN);
-  if (s == HIGH && lastTouch2State == LOW) {  // rising edge = new touch
-    if (mode == MODE_SET_FOCUS) {
-      mode = MODE_SET_BREAK;
-      Serial.println("Touch 2 — setting BREAK timer");
-    } else if (mode == MODE_SET_BREAK) {
-      mode = MODE_IDLE;
-      Serial.print("Touch 2 — saved. Focus=");
-      Serial.print(focusMinutes);
-      Serial.print("min Break=");
-      Serial.print(breakMinutes);
-      Serial.println("min");
-    } else {  // from idle or a running phase, enter set mode
-      mode = MODE_SET_FOCUS;
-      Serial.println("Touch 2 — setting FOCUS timer");
-    }
+  if (!touchPressed(TOUCH2_PIN, touch2Count, touch2Latched)) return;
+
+  if (mode == MODE_SET_FOCUS) {
+    mode = MODE_SET_BREAK;
+    Serial.println("Touch 2 — setting BREAK timer");
+  } else if (mode == MODE_SET_BREAK) {
+    mode = MODE_IDLE;
+    Serial.print("Touch 2 — saved. Focus=");
+    Serial.print(focusMinutes);
+    Serial.print("min Break=");
+    Serial.print(breakMinutes);
+    Serial.println("min");
+  } else if (mode == MODE_IDLE) {  // set mode is only reachable from idle
+    mode = MODE_SET_FOCUS;
+    Serial.println("Touch 2 — setting FOCUS timer");
+  } else {  // FOCUS or BREAK running: Touch 2 is locked out, only Touch 1 resets
+    Serial.println("Touch 2 ignored — timer running");
   }
-  lastTouch2State = s;
 }
 
 // Advance the focus/break cycle, apply the pot in set mode, and repaint.
@@ -213,18 +253,23 @@ void updateUI() {
 
 // Read the DHT22 and the digital LDR. Keeps last good DHT values on a failed read.
 void readSensors() {
+  // DIAGNOSTIC: watch the heap trend. A steady decline every cycle = a leak
+  // (prime suspect: the async HTTP path) and the eventual crash is heap starvation.
+  Serial.print("Heap: ");
+  Serial.print(ESP.getFreeHeap());
+
   float h = dht.readHumidity();
   float t = dht.readTemperature();
   ldrValue = digitalRead(LDR_PIN);  // HIGH = bright, LOW = dark
 
   if (isnan(h) || isnan(t)) {
-    Serial.println("Error: Unable to read data from DHT sensor.");
+    Serial.println("\tError: Unable to read data from DHT sensor.");
     return;
   }
   humidity = h;
   temperature = t;
 
-  Serial.print("Humidity: ");
+  Serial.print("\t Humidity: ");
   Serial.print(humidity);
   Serial.print(" %\t Temperature: ");
   Serial.print(temperature);
@@ -232,25 +277,18 @@ void readSensors() {
   Serial.println(ldrValue ? "bright" : "dark");
 }
 
-// Fires as the async request progresses; readyState 4 means the exchange is done.
-void onRequestComplete(void* optParm, AsyncHTTPRequest* req, int readyState) {
-  if (readyState != 4) return;  // only care about the completed state
-  Serial.print("HTTP Response code: ");
-  Serial.println(req->responseHTTPcode());
-}
-
-// Push the latest readings to the backend. Non-blocking: send() dispatches the
-// request and returns immediately; the result arrives in onRequestComplete().
+// Open the connection and fire off the POST, then hand the reply to
+// pollSyncResponse(). Only connect() may block (bounded by CONNECT_TIMEOUT_MS);
+// writing the request goes into the socket buffer and returns immediately.
 void syncToServer() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi Disconnected");
     return;
   }
 
-  // readyState 0 = idle, 4 = done. Anything else means a request is still in
-  // flight, so skip this cycle rather than stomp on it.
-  if (request.readyState() != 0 && request.readyState() != 4) {
-    Serial.println("Previous request still in flight — skipping sync");
+  // A reply from the previous sync is still pending — let the poller finish it.
+  if (syncState != SYNC_IDLE) {
+    Serial.println("Previous sync still awaiting reply — skipping");
     return;
   }
 
@@ -263,12 +301,54 @@ void syncToServer() {
 
   String jsonBody = JSON.stringify(doc);
 
-  if (request.open("POST", serverName)) {
-    request.setReqHeader("Content-Type", "application/json");
-    request.send(jsonBody);
-    touchDetected = false;  // reset once the payload is dispatched
-  } else {
-    Serial.println("Failed to open async request");
+  // Blocking connect — acceptable, and bounded by the timeout.
+  syncClient.setTimeout(CONNECT_TIMEOUT_MS);
+  if (!syncClient.connect(serverHost, serverPort)) {
+    Serial.println("Sync connect failed");
+    syncClient.stop();
+    return;  // keep touchDetected set so the next cycle retries
+  }
+
+  // Send the request without waiting for the response.
+  syncClient.print(F("POST "));
+  syncClient.print(serverPath);
+  syncClient.print(F(" HTTP/1.1\r\nHost: "));
+  syncClient.print(serverHost);
+  syncClient.print(':');
+  syncClient.print(serverPort);
+  syncClient.print(F("\r\nContent-Type: application/json\r\nContent-Length: "));
+  syncClient.print(jsonBody.length());
+  syncClient.print(F("\r\nConnection: close\r\n\r\n"));
+  syncClient.print(jsonBody);
+
+  syncState = SYNC_WAITING;
+  syncSentAt = millis();
+  syncStatusLine = "";
+  touchDetected = false;  // request is on its way
+}
+
+// Non-blocking reply handler: reads only bytes already available, so it never
+// waits on the network. Grabs the HTTP status line, then closes the socket.
+void pollSyncResponse() {
+  if (syncState != SYNC_WAITING) return;
+
+  while (syncClient.available()) {
+    char c = syncClient.read();
+    if (c == '\n') {  // end of the status line ("HTTP/1.1 200 OK")
+      Serial.print("HTTP status: ");
+      Serial.println(syncStatusLine);
+      syncClient.stop();
+      syncState = SYNC_IDLE;
+      return;
+    }
+    if (c != '\r') syncStatusLine += c;
+  }
+
+  // No (complete) reply in time, or the peer dropped: close and move on.
+  if (!syncClient.connected() || millis() - syncSentAt > RESPONSE_TIMEOUT_MS) {
+    Serial.println("Sync reply timed out / connection closed");
+    syncClient.stop();
+    syncState = SYNC_IDLE;
   }
 }
 
@@ -290,6 +370,12 @@ void monitorWiFi() {
 
 void setup() {
   Serial.begin(115200);
+
+  // DIAGNOSTIC: why did we just (re)boot? "Exception"/"Software Watchdog" point
+  // at a code fault; "External System"/"Power on" is a normal/manual reset.
+  Serial.print("\n\nReset reason: ");
+  Serial.println(ESP.getResetReason());
+
   dht.begin();
 
   pinMode(TOUCH1_PIN, INPUT);  // TTP223 actively drives the line
@@ -311,16 +397,13 @@ void setup() {
   WiFi.begin(ssid, password);
   Serial.println("Connecting to WiFi in background...");
 
-  // Wire up the async HTTP request once; the callback handles every response.
-  request.setDebug(false);
-  request.onReadyStateChange(onRequestComplete);
-
-  // Register the asynchronous events.
+  // Register the event-loop tasks.
   app.onRepeat(TOUCH_POLL_INTERVAL, checkTouch1);
   app.onRepeat(TOUCH_POLL_INTERVAL, checkTouch2);
   app.onRepeat(UI_INTERVAL, updateUI);
   app.onRepeat(SENSOR_READ_INTERVAL, readSensors);
   app.onRepeat(SYNC_INTERVAL, syncToServer);
+  app.onRepeat(SYNC_POLL_INTERVAL, pollSyncResponse);
   app.onRepeat(WIFI_MONITOR_INTERVAL, monitorWiFi);
 }
 
