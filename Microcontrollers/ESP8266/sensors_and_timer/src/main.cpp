@@ -6,6 +6,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_ADS1X15.h>
 #include <ReactESP.h>
 
 using namespace reactesp;
@@ -29,8 +30,8 @@ const char* serverPath = "/api/esp8266-sync";
 #define DHTPIN 2      //D4
 #define DHTTYPE DHT22
 
-#define LDR_PIN 14    //D5  — digital light/dark (HIGH = bright, LOW = dark)
-#define POT_PIN A0    //     — potentiometer wiper (only ADC on the ESP8266)
+#define POT_PIN A0        //          — potentiometer wiper (ESP8266's own ADC)
+#define ADS_LDR_CHANNEL 0 // ADS1115 AIN0 — LDR divider (16-bit analog over I2C)
 
 #define TOUCH1_PIN 13 //D7  — start focus timer / stop the cycle
 #define TOUCH2_PIN 12 //D6  — cycle set mode (focus -> break -> idle)
@@ -61,6 +62,8 @@ const char* serverPath = "/api/esp8266-sync";
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 DHT dht(DHTPIN, DHTTYPE);
+Adafruit_ADS1115 ads;   // external 16-bit ADC on the shared I2C bus (addr 0x48)
+bool adsReady = false;  // set true once ads.begin() succeeds
 
 ReactESP app;  // ReactESP 2.x — v3 dropped ESP8266 support (requires FreeRTOS)
 
@@ -78,7 +81,7 @@ wl_status_t lastWifiStatus = WL_IDLE_STATUS;
 // by the display and sync events.
 float humidity = 0.0;
 float temperature = 0.0;
-int ldrValue = 0;  // 1 = bright, 0 = dark
+int ldrValue = 0;  // raw 16-bit ADS1115 reading (higher = brighter)
 
 // --- Study Buddy timer state ----------------------------------------------
 
@@ -260,7 +263,9 @@ void readSensors() {
 
   float h = dht.readHumidity();
   float t = dht.readTemperature();
-  ldrValue = digitalRead(LDR_PIN);  // HIGH = bright, LOW = dark
+  if (adsReady) {
+    ldrValue = ads.readADC_SingleEnded(ADS_LDR_CHANNEL);  // 16-bit, ~few ms
+  }
 
   if (isnan(h) || isnan(t)) {
     Serial.println("\tError: Unable to read data from DHT sensor.");
@@ -273,8 +278,11 @@ void readSensors() {
   Serial.print(humidity);
   Serial.print(" %\t Temperature: ");
   Serial.print(temperature);
-  Serial.print(" °C\t Light: ");
-  Serial.println(ldrValue ? "bright" : "dark");
+  Serial.print(" °C\t LDR: ");
+  Serial.print(ldrValue);
+  Serial.print(" (");
+  Serial.print(ads.computeVolts(ldrValue), 3);
+  Serial.println(" V)");
 }
 
 // Open the connection and fire off the POST, then hand the reply to
@@ -380,7 +388,6 @@ void setup() {
 
   pinMode(TOUCH1_PIN, INPUT);  // TTP223 actively drives the line
   pinMode(TOUCH2_PIN, INPUT);
-  pinMode(LDR_PIN, INPUT);     // divider node drives the pin; no pull-up
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -388,6 +395,15 @@ void setup() {
   } else {
     display.clearDisplay();
     display.display();
+  }
+
+  // External ADC for the LDR (shares the I2C bus; default address 0x48).
+  if (ads.begin()) {
+    ads.setGain(GAIN_ONE);  // ±4.096 V full scale — LDR node tops out at 3.3 V
+    adsReady = true;
+    Serial.println("ADS1115 ready");
+  } else {
+    Serial.println("ADS1115 not found (check wiring / ADDR->GND for 0x48)");
   }
 
   // Kick off the WiFi connection but don't block on it; monitorWiFi() reports

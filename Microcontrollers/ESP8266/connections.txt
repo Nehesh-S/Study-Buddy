@@ -9,12 +9,20 @@ OLED Display:
     SCL -> D1
     SDA -> D2
 
-LDR (digital light/dark, RC divider into a digital pin):
+ADS1115 (external 16-bit I2C ADC, for the analog LDR):
+    VDD  -> 3V3
+    GND  -> GND
+    SCL  -> D1    (shared I2C bus with the OLED)
+    SDA  -> D2    (shared I2C bus with the OLED)
+    ADDR -> GND   (sets I2C address 0x48)
+    ALRT -> (not connected)
+    A0   -> LDR divider junction (see below)
+
+LDR (analog, divider into ADS1115 channel A0):
     LDR Pin 1      -> 3V3
-    LDR Pin 2      -> D5   (junction node, read as digital HIGH=bright / LOW=dark)
-    Resistor Pin 1 -> D5   (same junction node)
+    LDR Pin 2      -> ADS1115 A0   (junction node)
+    Resistor Pin 1 -> ADS1115 A0   (same junction node)
     Resistor Pin 2 -> GND
-    // NOTE: moved off A0 so the potentiometer can use the ESP8266's only ADC.
 
 Potentiometer (analog, sets the timer values):
     Pin 1 (end)   -> 3V3
