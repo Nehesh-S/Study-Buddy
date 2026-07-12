@@ -42,6 +42,11 @@ const char* serverPath = "/api/esp8266-sync";
 #define LED_YELLOW_PIN 16 //D0
 #define LED_GREEN_PIN 15  //D8
 
+// Alert LED (active HIGH) — blinks when the backend reports distracted/away.
+// GPIO0/D3 is a boot-strap pin (must be HIGH at boot); an LED-to-GND is a light
+// enough load that the pin's pull-up still boots normally.
+#define LED_BLUE_PIN 0    //D3
+
 // Fraction of a phase after which the yellow "about to switch" LED joins in.
 #define LED_WARN_NUMERATOR 9
 #define LED_WARN_DENOMINATOR 10
@@ -64,6 +69,7 @@ const char* serverPath = "/api/esp8266-sync";
 #define SYNC_INTERVAL 5000
 #define SYNC_POLL_INTERVAL 50
 #define WIFI_MONITOR_INTERVAL 500
+#define ALERT_BLINK_INTERVAL 250  // blue LED toggles at this rate = ~2 Hz blink
 
 // A touch must read HIGH for this many consecutive polls (~60 ms) to count.
 // Rejects brief glitches — e.g. TTP223 output blips when WiFi transmit spikes
@@ -82,7 +88,11 @@ WiFiClient syncClient;
 enum SyncState { SYNC_IDLE, SYNC_WAITING };  // WAITING = request sent, reply pending
 SyncState syncState = SYNC_IDLE;
 unsigned long syncSentAt = 0;
-String syncStatusLine;  // accumulates the HTTP status line as bytes trickle in
+String syncResponse;  // accumulates the full HTTP reply as bytes trickle in
+
+// Set from the backend's current_state: true while "distracted"/"away" so the
+// blue LED blinks; false on "working". Consumed by blinkAlertLed().
+bool alertActive = false;
 
 // Tracks WiFi connection state so we can log transitions without blocking.
 wl_status_t lastWifiStatus = WL_IDLE_STATUS;
@@ -111,6 +121,12 @@ int breakMinutes = DEFAULT_MINUTES;
 unsigned long phaseStartMillis = 0;              // when the running phase began
 unsigned long currentTimerSeconds = DEFAULT_MINUTES * 60UL;  // shown + synced value
 
+// Focus pause (backend reports distracted/away). While paused we freeze the
+// elapsed time at pausedElapsed; on resume phaseStartMillis is shifted forward
+// so the countdown continues from exactly where it stopped.
+bool timerPaused = false;
+unsigned long pausedElapsed = 0;
+
 // Touch confirmation state (TTP223 drives the line HIGH while touched).
 int touch1Count = 0;
 bool touch1Latched = false;
@@ -122,11 +138,25 @@ bool touchDetected = false;  // sensor-1 touched since last sync (telemetry)
 unsigned long focusDurationMs() { return (unsigned long)focusMinutes * 60UL * 1000UL; }
 unsigned long breakDurationMs() { return (unsigned long)breakMinutes * 60UL * 1000UL; }
 
+// Effective elapsed time in the running phase — frozen while paused.
+unsigned long phaseElapsed() {
+  return timerPaused ? pausedElapsed : (millis() - phaseStartMillis);
+}
+
 // Remaining whole seconds in the running phase, clamped so it never underflows.
 unsigned long remainingSeconds(unsigned long durationMs) {
-  unsigned long elapsed = millis() - phaseStartMillis;
+  unsigned long elapsed = phaseElapsed();
   if (elapsed >= durationMs) return 0;
   return (durationMs - elapsed) / 1000;
+}
+
+// Begin a fresh focus phase from the top, unpaused and assuming "working"
+// until the backend says otherwise.
+void startFocusPhase() {
+  mode = MODE_FOCUS;
+  phaseStartMillis = millis();
+  timerPaused = false;
+  alertActive = false;
 }
 
 // Map the potentiometer to a whole number of minutes in [MIN, MAX].
@@ -181,8 +211,7 @@ void checkTouch1() {
 
   touchDetected = true;
   if (mode == MODE_IDLE) {
-    mode = MODE_FOCUS;
-    phaseStartMillis = millis();
+    startFocusPhase();
     Serial.println("Touch 1 — focus timer started");
   } else if (mode == MODE_FOCUS || mode == MODE_BREAK) {
     mode = MODE_IDLE;  // stop the cycle and return to idle
@@ -223,11 +252,11 @@ void updateLeds() {
   if (mode == MODE_FOCUS) {
     red = true;
     unsigned long warnAt = focusDurationMs() * LED_WARN_NUMERATOR / LED_WARN_DENOMINATOR;
-    if (millis() - phaseStartMillis >= warnAt) yellow = true;
+    if (phaseElapsed() >= warnAt) yellow = true;
   } else if (mode == MODE_BREAK) {
     green = true;
     unsigned long warnAt = breakDurationMs() * LED_WARN_NUMERATOR / LED_WARN_DENOMINATOR;
-    if (millis() - phaseStartMillis >= warnAt) yellow = true;
+    if (phaseElapsed() >= warnAt) yellow = true;
   }
 
   digitalWrite(LED_RED_PIN, red ? HIGH : LOW);
@@ -237,30 +266,44 @@ void updateLeds() {
 
 // Advance the focus/break cycle, apply the pot in set mode, and repaint.
 void updateUI() {
-  // 1) Advance the running phases; when one ends, the other starts automatically.
-  if (mode == MODE_FOCUS && millis() - phaseStartMillis >= focusDurationMs()) {
+  // 1) Pause/resume the focus countdown from the backend's camera state. Only
+  //    focus is affected; break/idle ignore it. Freezing elapsed here stops the
+  //    phase from advancing below.
+  bool shouldPause = (mode == MODE_FOCUS && alertActive);
+  if (shouldPause && !timerPaused) {
+    pausedElapsed = millis() - phaseStartMillis;
+    timerPaused = true;
+    Serial.println("Focus paused — distracted/away");
+  } else if (!shouldPause && timerPaused) {
+    phaseStartMillis = millis() - pausedElapsed;  // continue where we stopped
+    timerPaused = false;
+    Serial.println("Focus resumed — working");
+  }
+
+  // 2) Advance the running phases; when one ends, the other starts automatically.
+  //    phaseElapsed() is frozen while paused, so a paused focus never expires.
+  if (mode == MODE_FOCUS && phaseElapsed() >= focusDurationMs()) {
     mode = MODE_BREAK;
     phaseStartMillis = millis();
     Serial.println("Focus finished — break started");
-  } else if (mode == MODE_BREAK && millis() - phaseStartMillis >= breakDurationMs()) {
-    mode = MODE_FOCUS;
-    phaseStartMillis = millis();
+  } else if (mode == MODE_BREAK && phaseElapsed() >= breakDurationMs()) {
+    startFocusPhase();
     Serial.println("Break finished — focus started");
   }
 
-  // 2) In set mode the value snaps to the potentiometer position.
+  // 3) In set mode the value snaps to the potentiometer position.
   if (mode == MODE_SET_FOCUS) {
     focusMinutes = readPotMinutes();
   } else if (mode == MODE_SET_BREAK) {
     breakMinutes = readPotMinutes();
   }
 
-  // 3) Decide what to show.
+  // 4) Decide what to show.
   const char* label;
   unsigned long showSeconds;
   switch (mode) {
     case MODE_FOCUS:
-      label = "FOCUS";
+      label = timerPaused ? "FOCUS PAUSED" : "FOCUS";
       showSeconds = remainingSeconds(focusDurationMs());
       break;
     case MODE_BREAK:
@@ -364,33 +407,70 @@ void syncToServer() {
 
   syncState = SYNC_WAITING;
   syncSentAt = millis();
-  syncStatusLine = "";
+  syncResponse = "";
+  syncResponse.reserve(256);
   touchDetected = false;  // request is on its way
 }
 
+// Parse the reply body and act on current_state ("working"/"distracted"/"away").
+// Only the focus phase cares about the camera state — break/idle ignore it.
+void handleSyncResponse() {
+  if (mode != MODE_FOCUS) return;
+
+  // Grab the JSON object out of the raw reply (robust to headers / chunking).
+  int start = syncResponse.indexOf('{');
+  int end = syncResponse.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    Serial.println("Sync reply: no JSON body");
+    return;
+  }
+
+  JSONVar doc = JSON.parse(syncResponse.substring(start, end + 1));
+  if (JSON.typeof(doc) == "undefined" || !doc.hasOwnProperty("current_state")) {
+    Serial.println("Sync reply: bad JSON / no current_state");
+    return;
+  }
+
+  String state = (const char*)doc["current_state"];
+  alertActive = (state == "distracted" || state == "away");  // pauses + blinks blue
+  Serial.print("current_state: ");
+  Serial.print(state);
+  Serial.println(alertActive ? "  -> ALERT (focus paused, blue blinking)" : "  -> working");
+}
+
 // Non-blocking reply handler: reads only bytes already available, so it never
-// waits on the network. Grabs the HTTP status line, then closes the socket.
+// waits on the network. Accumulates the full reply, then parses it on close.
 void pollSyncResponse() {
   if (syncState != SYNC_WAITING) return;
 
   while (syncClient.available()) {
-    char c = syncClient.read();
-    if (c == '\n') {  // end of the status line ("HTTP/1.1 200 OK")
-      Serial.print("HTTP status: ");
-      Serial.println(syncStatusLine);
-      syncClient.stop();
-      syncState = SYNC_IDLE;
-      return;
-    }
-    if (c != '\r') syncStatusLine += c;
+    syncResponse += (char)syncClient.read();
   }
 
-  // No (complete) reply in time, or the peer dropped: close and move on.
-  if (!syncClient.connected() || millis() - syncSentAt > RESPONSE_TIMEOUT_MS) {
-    Serial.println("Sync reply timed out / connection closed");
+  // Peer closed (we sent "Connection: close") or we ran out of patience.
+  bool closed = !syncClient.connected();
+  bool timedOut = millis() - syncSentAt > RESPONSE_TIMEOUT_MS;
+  if (closed || timedOut) {
+    if (syncResponse.length() > 0) {
+      handleSyncResponse();
+    } else {
+      Serial.println("Sync reply timed out (no data)");
+    }
     syncClient.stop();
     syncState = SYNC_IDLE;
   }
+}
+
+// Blink the blue alert LED while distracted/away during focus; off otherwise.
+void blinkAlertLed() {
+  static bool on = false;
+  if (!(alertActive && mode == MODE_FOCUS)) {
+    on = false;
+    digitalWrite(LED_BLUE_PIN, LOW);
+    return;
+  }
+  on = !on;
+  digitalWrite(LED_BLUE_PIN, on ? HIGH : LOW);
 }
 
 // Log WiFi connect/disconnect transitions without blocking startup.
@@ -425,9 +505,11 @@ void setup() {
   pinMode(LED_RED_PIN, OUTPUT);
   pinMode(LED_YELLOW_PIN, OUTPUT);
   pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(LED_BLUE_PIN, OUTPUT);
   digitalWrite(LED_RED_PIN, LOW);
   digitalWrite(LED_YELLOW_PIN, LOW);
   digitalWrite(LED_GREEN_PIN, LOW);
+  digitalWrite(LED_BLUE_PIN, LOW);
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -460,6 +542,7 @@ void setup() {
   app.onRepeat(SENSOR_READ_INTERVAL, readSensors);
   app.onRepeat(SYNC_INTERVAL, syncToServer);
   app.onRepeat(SYNC_POLL_INTERVAL, pollSyncResponse);
+  app.onRepeat(ALERT_BLINK_INTERVAL, blinkAlertLed);
   app.onRepeat(WIFI_MONITOR_INTERVAL, monitorWiFi);
 }
 

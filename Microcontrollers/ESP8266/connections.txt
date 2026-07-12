@@ -43,3 +43,6 @@ Traffic-light LEDs:
     RED    -> D5   (GPIO14)
     YELLOW -> D0   (GPIO16)
     GREEN  -> D8   (GPIO15)
+
+Alert LED (blue) -- blinks when backend reports "distracted" or "away":
+    BLUE   -> D3   (GPIO0)
