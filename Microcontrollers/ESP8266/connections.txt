@@ -38,3 +38,8 @@ Touch Sensor 2 (TTP223):    // Enter/cycle set mode (focus -> break -> idle)
     VCC -> 3V3
     I/O -> D6    // moved off D3 (GPIO0) which is a boot-strapping pin
     GND -> GND
+
+Traffic-light LEDs:
+    RED    -> D5   (GPIO14)
+    YELLOW -> D0   (GPIO16)
+    GREEN  -> D8   (GPIO15)

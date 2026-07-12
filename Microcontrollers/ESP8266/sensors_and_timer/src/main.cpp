@@ -36,6 +36,16 @@ const char* serverPath = "/api/esp8266-sync";
 #define TOUCH1_PIN 13 //D7  — start focus timer / stop the cycle
 #define TOUCH2_PIN 12 //D6  — cycle set mode (focus -> break -> idle)
 
+// Traffic-light LEDs (active HIGH). GPIO15/D8 is a boot-strap pin, but an
+// LED-to-GND holds it LOW at boot, which is the required state.
+#define LED_RED_PIN 14    //D5
+#define LED_YELLOW_PIN 16 //D0
+#define LED_GREEN_PIN 15  //D8
+
+// Fraction of a phase after which the yellow "about to switch" LED joins in.
+#define LED_WARN_NUMERATOR 9
+#define LED_WARN_DENOMINATOR 10
+
 // Timer configuration
 #define MIN_MINUTES 1
 #define MAX_MINUTES 10
@@ -203,6 +213,28 @@ void checkTouch2() {
   }
 }
 
+// Drive the traffic-light LEDs from the current phase and its progress:
+//   FOCUS  first 90% -> red;            last 10% -> red + yellow
+//   BREAK  first 90% -> green;          last 10% -> green + yellow
+//   IDLE / SET modes -> all off.
+void updateLeds() {
+  bool red = false, yellow = false, green = false;
+
+  if (mode == MODE_FOCUS) {
+    red = true;
+    unsigned long warnAt = focusDurationMs() * LED_WARN_NUMERATOR / LED_WARN_DENOMINATOR;
+    if (millis() - phaseStartMillis >= warnAt) yellow = true;
+  } else if (mode == MODE_BREAK) {
+    green = true;
+    unsigned long warnAt = breakDurationMs() * LED_WARN_NUMERATOR / LED_WARN_DENOMINATOR;
+    if (millis() - phaseStartMillis >= warnAt) yellow = true;
+  }
+
+  digitalWrite(LED_RED_PIN, red ? HIGH : LOW);
+  digitalWrite(LED_YELLOW_PIN, yellow ? HIGH : LOW);
+  digitalWrite(LED_GREEN_PIN, green ? HIGH : LOW);
+}
+
 // Advance the focus/break cycle, apply the pot in set mode, and repaint.
 void updateUI() {
   // 1) Advance the running phases; when one ends, the other starts automatically.
@@ -252,6 +284,7 @@ void updateUI() {
 
   currentTimerSeconds = showSeconds;
   updateDisplay(label, showSeconds);
+  updateLeds();
 }
 
 // Read the DHT22 and the digital LDR. Keeps last good DHT values on a failed read.
@@ -388,6 +421,13 @@ void setup() {
 
   pinMode(TOUCH1_PIN, INPUT);  // TTP223 actively drives the line
   pinMode(TOUCH2_PIN, INPUT);
+
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_YELLOW_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  digitalWrite(LED_RED_PIN, LOW);
+  digitalWrite(LED_YELLOW_PIN, LOW);
+  digitalWrite(LED_GREEN_PIN, LOW);
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
