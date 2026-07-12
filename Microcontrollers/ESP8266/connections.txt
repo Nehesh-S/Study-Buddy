@@ -17,12 +17,18 @@ ADS1115 (external 16-bit I2C ADC, for the analog LDR):
     ADDR -> GND   (sets I2C address 0x48)
     ALRT -> (not connected)
     A0   -> LDR divider junction (see below)
+    A1   -> Suppress button (see below)
 
 LDR (analog, divider into ADS1115 channel A0):
     LDR Pin 1      -> 3V3
     LDR Pin 2      -> ADS1115 A0   (junction node)
     Resistor Pin 1 -> ADS1115 A0   (same junction node)
     Resistor Pin 2 -> GND
+
+Suppress push button (mutes the blue alert LED):
+    Button Pin 1   -> 3V3
+    Button Pin 2   -> ADS1115 A1   (junction node)
+    Resistor       -> ADS1115 A1 -> GND   (~10k pull-down, so idle reads ~0)
 
 Potentiometer (analog, sets the timer values):
     Pin 1 (end)   -> 3V3

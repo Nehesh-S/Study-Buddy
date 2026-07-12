@@ -33,6 +33,12 @@ const char* serverPath = "/api/esp8266-sync";
 #define POT_PIN A0        //          — potentiometer wiper (ESP8266's own ADC)
 #define ADS_LDR_CHANNEL 0 // ADS1115 AIN0 — LDR divider (16-bit analog over I2C)
 
+// Suppress push button read via a spare ADS1115 channel (all ESP GPIOs are
+// used). Button ties AIN1 to 3V3 when pressed, a pull-down holds it near 0 V
+// otherwise; anything above the threshold counts as pressed.
+#define ADS_BUTTON_CHANNEL 1
+#define BUTTON_PRESS_THRESHOLD 10000  // ~1.25 V at GAIN_ONE (idle ~0, pressed ~26000)
+
 #define TOUCH1_PIN 13 //D7  — start focus timer / stop the cycle
 #define TOUCH2_PIN 12 //D6  — cycle set mode (focus -> break -> idle)
 
@@ -70,6 +76,7 @@ const char* serverPath = "/api/esp8266-sync";
 #define SYNC_POLL_INTERVAL 50
 #define WIFI_MONITOR_INTERVAL 500
 #define ALERT_BLINK_INTERVAL 250  // blue LED toggles at this rate = ~2 Hz blink
+#define SUPPRESS_POLL_INTERVAL 150  // how often the suppress button is sampled
 
 // A touch must read HIGH for this many consecutive polls (~60 ms) to count.
 // Rejects brief glitches — e.g. TTP223 output blips when WiFi transmit spikes
@@ -93,6 +100,11 @@ String syncResponse;  // accumulates the full HTTP reply as bytes trickle in
 // Set from the backend's current_state: true while "distracted"/"away" so the
 // blue LED blinks; false on "working". Consumed by blinkAlertLed().
 bool alertActive = false;
+
+// Suppress button: when pressed, mutes the blue blink for the current alert
+// window. Cleared by each fresh distracted/away reply, so the blink returns.
+bool alertSuppressed = false;
+bool buttonWasPressed = false;  // for rising-edge detection on the ADS button
 
 // Tracks WiFi connection state so we can log transitions without blocking.
 wl_status_t lastWifiStatus = WL_IDLE_STATUS;
@@ -433,6 +445,7 @@ void handleSyncResponse() {
 
   String state = (const char*)doc["current_state"];
   alertActive = (state == "distracted" || state == "away");  // pauses + blinks blue
+  if (alertActive) alertSuppressed = false;  // a fresh alert re-arms the blink
   Serial.print("current_state: ");
   Serial.print(state);
   Serial.println(alertActive ? "  -> ALERT (focus paused, blue blinking)" : "  -> working");
@@ -461,16 +474,30 @@ void pollSyncResponse() {
   }
 }
 
-// Blink the blue alert LED while distracted/away during focus; off otherwise.
+// Blink the blue alert LED while distracted/away during focus, unless the
+// suppress button has muted it for this window; off otherwise.
 void blinkAlertLed() {
   static bool on = false;
-  if (!(alertActive && mode == MODE_FOCUS)) {
+  if (!(alertActive && mode == MODE_FOCUS && !alertSuppressed)) {
     on = false;
     digitalWrite(LED_BLUE_PIN, LOW);
     return;
   }
   on = !on;
   digitalWrite(LED_BLUE_PIN, on ? HIGH : LOW);
+}
+
+// Poll the suppress push button (on a spare ADS1115 channel). A fresh press
+// mutes the blue blink for the current alert window; the ~150 ms sample rate
+// also debounces the mechanical contacts.
+void checkSuppressButton() {
+  if (!adsReady) return;
+  bool pressed = ads.readADC_SingleEnded(ADS_BUTTON_CHANNEL) > BUTTON_PRESS_THRESHOLD;
+  if (pressed && !buttonWasPressed) {  // rising edge = new press
+    alertSuppressed = true;
+    Serial.println("Suppress button — blue blink muted for this window");
+  }
+  buttonWasPressed = pressed;
 }
 
 // Log WiFi connect/disconnect transitions without blocking startup.
@@ -543,6 +570,7 @@ void setup() {
   app.onRepeat(SYNC_INTERVAL, syncToServer);
   app.onRepeat(SYNC_POLL_INTERVAL, pollSyncResponse);
   app.onRepeat(ALERT_BLINK_INTERVAL, blinkAlertLed);
+  app.onRepeat(SUPPRESS_POLL_INTERVAL, checkSuppressButton);
   app.onRepeat(WIFI_MONITOR_INTERVAL, monitorWiFi);
 }
 
