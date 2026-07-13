@@ -85,6 +85,7 @@ const char* serverPath = "/api/esp8266-sync";
 #define UI_INTERVAL 200
 #define SENSOR_READ_INTERVAL 2000
 #define SYNC_INTERVAL 5000
+#define CYCLE_SECONDS (SYNC_INTERVAL / 1000UL)  // distracted seconds counted per distracted reply
 #define SYNC_POLL_INTERVAL 50
 #define WIFI_MONITOR_INTERVAL 500
 #define ALERT_BLINK_INTERVAL 250  // blue LED toggles at this rate = ~2 Hz blink
@@ -125,6 +126,12 @@ bool audioPlayed = false;        // first audio has fired this ladder (LED then 
 int postAudioCycles = 0;         // distracted cycles since the last audio nag
 bool isDistracted = false;       // last reply was "distracted"
 bool buttonWasPressed = false;   // for rising-edge detection on the ADS button
+
+// Distracted-time stats. sessionDistractedSeconds accumulates the current focus
+// session's distracted time (CYCLE_SECONDS per distracted reply);
+// minDistractedSeconds is the least of that across completed focus sessions.
+unsigned long sessionDistractedSeconds = 0;
+unsigned long minDistractedSeconds = 0xFFFFFFFFUL;  // sentinel: no session finished yet
 
 // Tracks WiFi connection state so we can log transitions without blocking.
 wl_status_t lastWifiStatus = WL_IDLE_STATUS;
@@ -194,12 +201,24 @@ void startFocusPhase() {
   audioPlayed = false;
   postAudioCycles = 0;
   isDistracted = false;
+  sessionDistractedSeconds = 0;  // fresh distracted-time tally for this session
 }
 
 // Map the potentiometer to a whole number of minutes in [MIN, MAX].
 int readPotMinutes() {
   int raw = analogRead(POT_PIN);
   return constrain(map(raw, 0, 1023, MIN_MINUTES, MAX_MINUTES), MIN_MINUTES, MAX_MINUTES);
+}
+
+// Print a duration as MM:SS at the current cursor.
+void printMMSS(unsigned long totalSeconds) {
+  unsigned long m = totalSeconds / 60;
+  unsigned long s = totalSeconds % 60;
+  if (m < 10) display.print('0');
+  display.print(m);
+  display.print(':');
+  if (s < 10) display.print('0');
+  display.print(s);
 }
 
 void updateDisplay(const char* label, unsigned long timerSeconds) {
@@ -219,6 +238,19 @@ void updateDisplay(const char* label, unsigned long timerSeconds) {
   display.print(":");
   if (secs < 10) display.print("0");
   display.print(secs);
+
+  // Bottom line: distracted-time stat. During focus, this session's distracted
+  // time; during break, the least distracted time across finished sessions.
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  if (mode == MODE_FOCUS) {
+    display.print("Distr ");
+    printMMSS(sessionDistractedSeconds);
+  } else if (mode == MODE_BREAK) {
+    display.print("Best ");
+    if (minDistractedSeconds == 0xFFFFFFFFUL) display.print("--:--");
+    else printMMSS(minDistractedSeconds);
+  }
 
   display.display();
 }
@@ -320,6 +352,9 @@ void updateUI() {
   // 2) Advance the running phases; when one ends, the other starts automatically.
   //    phaseElapsed() is frozen while paused, so a paused focus never expires.
   if (mode == MODE_FOCUS && phaseElapsed() >= focusDurationMs()) {
+    if (sessionDistractedSeconds < minDistractedSeconds) {
+      minDistractedSeconds = sessionDistractedSeconds;  // new best (least-distracted) session
+    }
     mode = MODE_BREAK;
     phaseStartMillis = millis();
     Serial.println("Focus finished — break started");
@@ -481,6 +516,7 @@ void handleSyncResponse() {
 
   if (distracted) {
     isDistracted = true;
+    sessionDistractedSeconds += CYCLE_SECONDS;  // count this distracted cycle
     if (suppressCyclesLeft > 0) {
       suppressCyclesLeft--;             // muted cycle: LED off, ladder frozen
     } else if (!audioPlayed) {
