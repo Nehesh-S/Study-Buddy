@@ -43,12 +43,13 @@ const char* serverPath = "/api/esp8266-sync";
 // DFPlayer Mini (mini MP3 module) on the hardware UART. Escalation: if a
 // distraction outlasts the blink/grace period, play a random track from the
 // SD folder "01" (= your distracted sounds, files 001.mp3, 002.mp3, ...).
-#define DFPLAYER_VOLUME 12         // 0..30 — moderate on purpose: high volume clips a
+#define DFPLAYER_VOLUME 10         // 0..30 — moderate on purpose: high volume clips a
                                    // small speaker and spikes current (distortion/cutout)
 #define DISTRACTED_FOLDER 1        // SD card folder "01"
 #define NUM_DISTRACTED_TRACKS 11    // set to how many NNN.mp3 files are in folder 01
-#define AUDIO_ESCALATE_CYCLES 2    // play audio once distraction lasts beyond this many cycles
-#define SUPPRESS_CYCLES 2          // button mutes the blue LED for this many alert cycles
+#define BLINK_CYCLES 2             // LED blinks this many distracted cycles, then audio fires
+#define SUPPRESS_CYCLES 2          // a button press mutes the LED for this many cycles first
+#define REPEAT_AUDIO_CYCLES 4      // after the first audio, re-play every this many distracted cycles
 
 #define TOUCH1_PIN 13 //D7  — start focus timer / stop the cycle
 #define TOUCH2_PIN 12 //D6  — cycle set mode (focus -> break -> idle)
@@ -114,13 +115,16 @@ String syncResponse;  // accumulates the full HTTP reply as bytes trickle in
 // blue LED blinks; false on "working". Consumed by blinkAlertLed().
 bool alertActive = false;
 
-// Suppress button: a press mutes the blue blink for SUPPRESS_CYCLES alert
-// cycles. distractedCycles counts consecutive "distracted" replies (for the
-// audio escalation); audioPlayed keeps the track from replaying every cycle.
-int suppressCyclesLeft = 0;
-int distractedCycles = 0;
-bool audioPlayed = false;
-bool buttonWasPressed = false;  // for rising-edge detection on the ADS button
+// Distracted-escalation ladder (per distracted episode during focus):
+//   blink for BLINK_CYCLES cycles -> play audio. A button press inserts
+//   SUPPRESS_CYCLES muted cycles and restarts the blink count, delaying audio.
+// Any non-distracted reply resets the whole thing.
+int suppressCyclesLeft = 0;      // muted cycles remaining (LED off)
+int blinkCyclesDone = 0;         // blinking cycles counted so far this ladder
+bool audioPlayed = false;        // first audio has fired this ladder (LED then solid on)
+int postAudioCycles = 0;         // distracted cycles since the last audio nag
+bool isDistracted = false;       // last reply was "distracted"
+bool buttonWasPressed = false;   // for rising-edge detection on the ADS button
 
 // Tracks WiFi connection state so we can log transitions without blocking.
 wl_status_t lastWifiStatus = WL_IDLE_STATUS;
@@ -186,8 +190,10 @@ void startFocusPhase() {
   timerPaused = false;
   alertActive = false;
   suppressCyclesLeft = 0;
-  distractedCycles = 0;
+  blinkCyclesDone = 0;
   audioPlayed = false;
+  postAudioCycles = 0;
+  isDistracted = false;
 }
 
 // Map the potentiometer to a whole number of minutes in [MIN, MAX].
@@ -471,26 +477,34 @@ void handleSyncResponse() {
 
   String state = (const char*)doc["current_state"];
   bool distracted = (state == "distracted");
-  alertActive = distracted || (state == "away");  // both pause + blink blue
+  alertActive = distracted || (state == "away");  // drives the focus pause
 
-  if (!alertActive) {
-    // "working": clean slate for the next alert episode.
-    distractedCycles = 0;
-    suppressCyclesLeft = 0;
-    audioPlayed = false;
-  } else {
-    if (suppressCyclesLeft > 0) suppressCyclesLeft--;  // consume one muted cycle
-    if (distracted) {
-      distractedCycles++;
-      // Escalate to sound once distraction outlasts the grace cycles.
-      if (distractedCycles > AUDIO_ESCALATE_CYCLES && !audioPlayed) {
-        playDistractedAudio();
+  if (distracted) {
+    isDistracted = true;
+    if (suppressCyclesLeft > 0) {
+      suppressCyclesLeft--;             // muted cycle: LED off, ladder frozen
+    } else if (!audioPlayed) {
+      blinkCyclesDone++;                // a blinking cycle
+      if (blinkCyclesDone > BLINK_CYCLES) {
+        playDistractedAudio();          // blinked long enough -> escalate to sound
         audioPlayed = true;
+        postAudioCycles = 0;            // start the re-nag counter (LED now solid on)
       }
     } else {
-      distractedCycles = 0;  // "away" breaks the distracted streak (no audio)
-      audioPlayed = false;
+      // Past the first audio: LED stays solid on; re-play periodically.
+      postAudioCycles++;
+      if (postAudioCycles >= REPEAT_AUDIO_CYCLES) {
+        playDistractedAudio();
+        postAudioCycles = 0;
+      }
     }
+  } else {
+    // "working" or "away" — anything but distracted resets the ladder.
+    isDistracted = false;
+    suppressCyclesLeft = 0;
+    blinkCyclesDone = 0;
+    audioPlayed = false;
+    postAudioCycles = 0;
   }
 
   Serial.print("current_state: ");
@@ -521,17 +535,24 @@ void pollSyncResponse() {
   }
 }
 
-// Blink the blue alert LED while distracted/away during focus, unless the
-// suppress button has muted it for this window; off otherwise.
+// Drive the blue LED for the distracted ladder (while distracted, in focus, and
+// not button-muted): blink during the pre-audio stage, then hold solid on after
+// the audio fires as a steady distracted-status indicator.
 void blinkAlertLed() {
   static bool on = false;
-  if (!(alertActive && mode == MODE_FOCUS && suppressCyclesLeft == 0)) {
+  bool active = isDistracted && mode == MODE_FOCUS && suppressCyclesLeft == 0;
+  if (!active) {
     on = false;
     digitalWrite(LED_BLUE_PIN, LOW);
     return;
   }
-  on = !on;
-  digitalWrite(LED_BLUE_PIN, on ? HIGH : LOW);
+  if (audioPlayed) {
+    on = true;                              // solid on after escalation
+    digitalWrite(LED_BLUE_PIN, HIGH);
+  } else {
+    on = !on;                               // blinking before escalation
+    digitalWrite(LED_BLUE_PIN, on ? HIGH : LOW);
+  }
 }
 
 // Poll the suppress push button (on a spare ADS1115 channel). A fresh press
@@ -541,8 +562,10 @@ void checkSuppressButton() {
   if (!adsReady) return;
   bool pressed = ads.readADC_SingleEnded(ADS_BUTTON_CHANNEL) > BUTTON_PRESS_THRESHOLD;
   if (pressed && !buttonWasPressed) {  // rising edge = new press
-    suppressCyclesLeft = SUPPRESS_CYCLES;
-    Serial.println("Suppress button — blue blink muted for 2 cycles");
+    suppressCyclesLeft = SUPPRESS_CYCLES;  // mute N cycles...
+    blinkCyclesDone = 0;                   // ...then blink N cycles again...
+    audioPlayed = false;                   // ...before audio can fire
+    Serial.println("Suppress button — mute, re-blink, then audio");
   }
   buttonWasPressed = pressed;
 }
