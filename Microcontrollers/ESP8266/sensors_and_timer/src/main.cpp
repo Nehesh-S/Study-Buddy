@@ -9,6 +9,8 @@
 #include <Adafruit_ADS1X15.h>
 #include <DFRobotDFPlayerMini.h>
 #include <ReactESP.h>
+#include <time.h>
+#include <string.h>
 
 using namespace reactesp;
 
@@ -28,16 +30,22 @@ const char* serverHost = "192.168.137.201";
 const uint16_t serverPort = 8000;
 const char* serverPath = "/api/esp8266-sync";
 
+// Wall-clock: parsed once from the HTTP Date header (UTC). Add your local offset.
+#define TZ_OFFSET_SECONDS (2 * 3600)  // UTC+2 = CEST (summer); use 1*3600 in winter
+
 #define DHTPIN 2      //D4
 #define DHTTYPE DHT22
 
 #define POT_PIN A0        //          — potentiometer wiper (ESP8266's own ADC)
 #define ADS_LDR_CHANNEL 0 // ADS1115 AIN0 — LDR divider (16-bit analog over I2C)
+#define LDR_DARK_THRESHOLD 5000  // ldrValue below this = "dark" (tune to your lighting)
 
-// Suppress push button read via a spare ADS1115 channel (all ESP GPIOs are
-// used). Button ties AIN1 to 3V3 when pressed, a pull-down holds it near 0 V
-// otherwise; anything above the threshold counts as pressed.
-#define ADS_BUTTON_CHANNEL 1
+// Push buttons read via spare ADS1115 channels (all ESP GPIOs are used). Each
+// button ties its AINx to 3V3 when pressed, a pull-down holds it near 0 V;
+// anything above the threshold counts as pressed.
+#define ADS_BUTTON_CHANNEL 1   // A1: suppress button (mutes blue blink in focus)
+#define ADS_BUTTON2_CHANNEL 2  // A2: plays 06/ in break/idle/time
+#define ADS_BUTTON3_CHANNEL 3  // A3: idle <-> time-state toggle
 #define BUTTON_PRESS_THRESHOLD 10000  // ~1.25 V at GAIN_ONE (idle ~0, pressed ~26000)
 
 // DFPlayer Mini (mini MP3 module) on the hardware UART. Escalation: if a
@@ -45,8 +53,20 @@ const char* serverPath = "/api/esp8266-sync";
 // SD folder "01" (= your distracted sounds, files 001.mp3, 002.mp3, ...).
 #define DFPLAYER_VOLUME 10         // 0..30 — moderate on purpose: high volume clips a
                                    // small speaker and spikes current (distortion/cutout)
-#define DISTRACTED_FOLDER 1        // SD card folder "01"
-#define NUM_DISTRACTED_TRACKS 11    // set to how many NNN.mp3 files are in folder 01
+#define DISTRACTED_FOLDER 1        // 01: nag sounds while distracted during focus
+#define BREAK_END_FOLDER 2         // 02: last 2 s of break (focus about to start)
+#define MISS_FOLDER 3              // 03: break start, did NOT beat the best distracted time
+#define BEAT_FOLDER 4              // 04: break start, beat the best (new high score)
+#define DARK_FOLDER 5              // 05: first time the LDR goes dark since boot
+#define EXTRA_FOLDER 6             // 06: button 2 in break/idle/time
+// Number of NNN.mp3 files in each folder — set these to your real file counts.
+// (Picking a random track above the count would play silence.)
+#define NUM_DISTRACTED_TRACKS 11
+#define NUM_BREAK_END_TRACKS 1
+#define NUM_MISS_TRACKS 1
+#define NUM_BEAT_TRACKS 1
+#define NUM_DARK_TRACKS 1
+#define NUM_EXTRA_TRACKS 1
 #define BLINK_CYCLES 2             // LED blinks this many distracted cycles, then audio fires
 #define SUPPRESS_CYCLES 2          // a button press mutes the LED for this many cycles first
 #define REPEAT_AUDIO_CYCLES 4      // after the first audio, re-play every this many distracted cycles
@@ -112,6 +132,11 @@ SyncState syncState = SYNC_IDLE;
 unsigned long syncSentAt = 0;
 String syncResponse;  // accumulates the full HTTP reply as bytes trickle in
 
+// Wall-clock, parsed once from the HTTP Date header (local epoch + a millis anchor).
+bool timeSynced = false;
+time_t syncedEpoch = 0;         // local epoch at the moment of sync
+unsigned long syncedAtMillis = 0;
+
 // Set from the backend's current_state: true while "distracted"/"away" so the
 // blue LED blinks; false on "working". Consumed by blinkAlertLed().
 bool alertActive = false;
@@ -125,13 +150,17 @@ int blinkCyclesDone = 0;         // blinking cycles counted so far this ladder
 bool audioPlayed = false;        // first audio has fired this ladder (LED then solid on)
 int postAudioCycles = 0;         // distracted cycles since the last audio nag
 bool isDistracted = false;       // last reply was "distracted"
-bool buttonWasPressed = false;   // for rising-edge detection on the ADS button
+bool buttonWasPressed = false;   // rising-edge state for the suppress button (A1)
+bool button2WasPressed = false;  // rising-edge state for button 2 (A2)
+bool button3WasPressed = false;  // rising-edge state for button 3 (A3)
 
 // Distracted-time stats. sessionDistractedSeconds accumulates the current focus
 // session's distracted time (CYCLE_SECONDS per distracted reply);
 // minDistractedSeconds is the least of that across completed focus sessions.
 unsigned long sessionDistractedSeconds = 0;
 unsigned long minDistractedSeconds = 0xFFFFFFFFUL;  // sentinel: no session finished yet
+bool breakEndAudioPlayed = false;  // "focus about to start" cue already fired this break
+bool darkAudioPlayed = false;      // 05/ cue fired for the current dark spell; reset when light
 
 // Tracks WiFi connection state so we can log transitions without blocking.
 wl_status_t lastWifiStatus = WL_IDLE_STATUS;
@@ -149,7 +178,8 @@ enum Mode {
   MODE_FOCUS,      // focus timer counting down
   MODE_BREAK,      // break timer counting down
   MODE_SET_FOCUS,  // pot sets the focus duration
-  MODE_SET_BREAK   // pot sets the break duration
+  MODE_SET_BREAK,  // pot sets the break duration
+  MODE_TIME        // clock screen: day/date/time only (entered from idle via button 3)
 };
 
 Mode mode = MODE_IDLE;
@@ -221,9 +251,52 @@ void printMMSS(unsigned long totalSeconds) {
   display.print(s);
 }
 
+// Current local wall-clock epoch, free-running from the one-time Date sync.
+time_t currentEpoch() {
+  return syncedEpoch + (time_t)((millis() - syncedAtMillis) / 1000UL);
+}
+
+// Print a string horizontally centred on the 128 px display at row y.
+void printCentered(const char* s, int y, int size) {
+  int w = (int)strlen(s) * 6 * size;
+  int x = (128 - w) / 2;
+  if (x < 0) x = 0;
+  display.setTextSize(size);
+  display.setCursor(x, y);
+  display.print(s);
+}
+
+// Time-state screen: day of week, date, and time — nothing else.
+void renderClock() {
+  if (!timeSynced) {
+    printCentered("Time not set", 28, 1);
+    return;
+  }
+  static const char* const DAYS[] =
+      {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+  static const char* const MONS[] =
+      {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+  time_t now = currentEpoch();
+  struct tm* t = gmtime(&now);  // already local (offset folded in at sync)
+
+  char buf[16];
+  printCentered(DAYS[t->tm_wday], 4, 2);
+  snprintf(buf, sizeof(buf), "%d %s %d", t->tm_mday, MONS[t->tm_mon], t->tm_year + 1900);
+  printCentered(buf, 26, 1);
+  snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
+  printCentered(buf, 40, 3);
+}
+
 void updateDisplay(const char* label, unsigned long timerSeconds) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+
+  if (mode == MODE_TIME) {  // clock screen only
+    renderClock();
+    display.display();
+    return;
+  }
 
   display.setTextSize(1);
   display.setCursor(0, 0);
@@ -333,8 +406,21 @@ void updateLeds() {
   digitalWrite(LED_GREEN_PIN, green ? HIGH : LOW);
 }
 
+// Play a random NNN.mp3 (1..numTracks) from the given SD folder.
+void playRandomFromFolder(uint8_t folder, uint8_t numTracks) {
+  if (!dfReady) return;
+  dfplayer.playFolder(folder, random(1, numTracks + 1));
+}
+
 // Advance the focus/break cycle, apply the pot in set mode, and repaint.
 void updateUI() {
+  // Time state: no timer logic — just draw the clock and keep the LEDs off.
+  if (mode == MODE_TIME) {
+    updateDisplay(nullptr, 0);
+    updateLeds();
+    return;
+  }
+
   // 1) Pause/resume the focus countdown from the backend's camera state. Only
   //    focus is affected; break/idle ignore it. Freezing elapsed here stops the
   //    phase from advancing below.
@@ -352,15 +438,28 @@ void updateUI() {
   // 2) Advance the running phases; when one ends, the other starts automatically.
   //    phaseElapsed() is frozen while paused, so a paused focus never expires.
   if (mode == MODE_FOCUS && phaseElapsed() >= focusDurationMs()) {
+    // Did this session beat the previous best? Compare before folding it in.
+    bool beatBest = (minDistractedSeconds != 0xFFFFFFFFUL) &&
+                    (sessionDistractedSeconds < minDistractedSeconds);
     if (sessionDistractedSeconds < minDistractedSeconds) {
-      minDistractedSeconds = sessionDistractedSeconds;  // new best (least-distracted) session
+      minDistractedSeconds = sessionDistractedSeconds;  // new/first best
     }
+    if (beatBest) playRandomFromFolder(BEAT_FOLDER, NUM_BEAT_TRACKS);   // high score!
+    else          playRandomFromFolder(MISS_FOLDER, NUM_MISS_TRACKS);   // didn't beat it
     mode = MODE_BREAK;
     phaseStartMillis = millis();
+    breakEndAudioPlayed = false;  // arm the "focus about to start" cue
     Serial.println("Focus finished — break started");
   } else if (mode == MODE_BREAK && phaseElapsed() >= breakDurationMs()) {
     startFocusPhase();
     Serial.println("Break finished — focus started");
+  }
+
+  // Break-ending cue: play the "focus about to start" sound once in the last 2 s.
+  if (mode == MODE_BREAK && !breakEndAudioPlayed &&
+      remainingSeconds(breakDurationMs()) <= 2) {
+    playRandomFromFolder(BREAK_END_FOLDER, NUM_BREAK_END_TRACKS);
+    breakEndAudioPlayed = true;
   }
 
   // 3) In set mode the value snaps to the potentiometer position.
@@ -413,6 +512,16 @@ void readSensors() {
   float t = dht.readTemperature();
   if (adsReady) {
     ldrValue = ads.readADC_SingleEnded(ADS_LDR_CHANNEL);  // 16-bit, ~few ms
+    // Edge-triggered dark cue: play once when it goes dark, re-arm when it's
+    // light again. So staying dark plays once; dark->light->dark plays twice.
+    if (ldrValue < LDR_DARK_THRESHOLD) {
+      if (!darkAudioPlayed) {
+        playRandomFromFolder(DARK_FOLDER, NUM_DARK_TRACKS);
+        darkAudioPlayed = true;
+      }
+    } else {
+      darkAudioPlayed = false;  // back in the light — arm for the next dark spell
+    }
   }
 
   if (isnan(h) || isnan(t)) {
@@ -486,9 +595,7 @@ void syncToServer() {
 
 // Play a random track from the distracted-sounds folder on the DFPlayer's SD.
 void playDistractedAudio() {
-  if (!dfReady) return;
-  uint8_t track = random(1, NUM_DISTRACTED_TRACKS + 1);  // 1..NUM
-  dfplayer.playFolder(DISTRACTED_FOLDER, track);
+  playRandomFromFolder(DISTRACTED_FOLDER, NUM_DISTRACTED_TRACKS);
 }
 
 // Parse the reply body and act on current_state ("working"/"distracted"/"away").
@@ -548,6 +655,41 @@ void handleSyncResponse() {
   Serial.println(alertActive ? "  -> ALERT" : "  -> working");
 }
 
+// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
+long daysFromCivil(int y, int m, int d) {
+  y -= m <= 2;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  int yoe = (int)(y - era * 400);
+  int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + doe - 719468;
+}
+
+// Set the wall-clock once from the reply's HTTP "Date:" header (RFC 7231 UTC,
+// e.g. "Sun, 13 Jul 2026 18:22:04 GMT"). No backend change needed — every HTTP
+// server adds this header automatically.
+void syncClockFromResponse() {
+  int idx = syncResponse.indexOf("Date:");
+  if (idx < 0) idx = syncResponse.indexOf("date:");
+  if (idx < 0) return;
+
+  int day, year, hh, mm, ss;
+  char mon[4] = {0};
+  const char* p = syncResponse.c_str() + idx + 5;
+  if (sscanf(p, " %*3s, %d %3s %d %d:%d:%d", &day, mon, &year, &hh, &mm, &ss) != 6) return;
+
+  static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char* mp = strstr(months, mon);
+  if (!mp) return;
+  int month = (int)((mp - months) / 3) + 1;
+
+  time_t utc = (time_t)daysFromCivil(year, month, day) * 86400L +
+               (time_t)hh * 3600L + mm * 60L + ss;
+  syncedEpoch = utc + TZ_OFFSET_SECONDS;
+  syncedAtMillis = millis();
+  timeSynced = true;
+}
+
 // Non-blocking reply handler: reads only bytes already available, so it never
 // waits on the network. Accumulates the full reply, then parses it on close.
 void pollSyncResponse() {
@@ -562,6 +704,7 @@ void pollSyncResponse() {
   bool timedOut = millis() - syncSentAt > RESPONSE_TIMEOUT_MS;
   if (closed || timedOut) {
     if (syncResponse.length() > 0) {
+      if (!timeSynced) syncClockFromResponse();  // one-time wall-clock from Date header
       handleSyncResponse();
     } else {
       Serial.println("Sync reply timed out (no data)");
@@ -591,19 +734,50 @@ void blinkAlertLed() {
   }
 }
 
-// Poll the suppress push button (on a spare ADS1115 channel). A fresh press
-// mutes the blue blink for the current alert window; the ~150 ms sample rate
-// also debounces the mechanical contacts.
+// Rising-edge press on an ADS button channel. The ~150 ms sample rate also
+// debounces the mechanical contacts.
+bool adsButtonPressed(uint8_t channel, bool& wasPressed) {
+  bool pressed = ads.readADC_SingleEnded(channel) > BUTTON_PRESS_THRESHOLD;
+  bool edge = pressed && !wasPressed;
+  wasPressed = pressed;
+  return edge;
+}
+
+// Button 1 (A1): only relevant in focus — a press mutes the blue blink and
+// restarts the escalation ladder (mute, re-blink, then audio).
 void checkSuppressButton() {
-  if (!adsReady) return;
-  bool pressed = ads.readADC_SingleEnded(ADS_BUTTON_CHANNEL) > BUTTON_PRESS_THRESHOLD;
-  if (pressed && !buttonWasPressed) {  // rising edge = new press
+  if (!adsReady || mode != MODE_FOCUS) { buttonWasPressed = false; return; }
+  if (adsButtonPressed(ADS_BUTTON_CHANNEL, buttonWasPressed)) {
     suppressCyclesLeft = SUPPRESS_CYCLES;  // mute N cycles...
     blinkCyclesDone = 0;                   // ...then blink N cycles again...
     audioPlayed = false;                   // ...before audio can fire
     Serial.println("Suppress button — mute, re-blink, then audio");
   }
-  buttonWasPressed = pressed;
+}
+
+// Buttons 2 (A2) and 3 (A3): only relevant in idle/break/time.
+//   Button 2 -> play a random 06/ track.
+//   Button 3 -> toggle idle <-> time state (does nothing in break).
+void checkModeButtons() {
+  bool active = (mode == MODE_IDLE || mode == MODE_BREAK || mode == MODE_TIME);
+  if (!adsReady || !active) {
+    button2WasPressed = false;
+    button3WasPressed = false;
+    return;
+  }
+  if (adsButtonPressed(ADS_BUTTON2_CHANNEL, button2WasPressed)) {
+    playRandomFromFolder(EXTRA_FOLDER, NUM_EXTRA_TRACKS);
+    Serial.println("Button 2 — play 06/");
+  }
+  if (adsButtonPressed(ADS_BUTTON3_CHANNEL, button3WasPressed)) {
+    if (mode == MODE_IDLE) {
+      mode = MODE_TIME;
+      Serial.println("Button 3 — time state");
+    } else if (mode == MODE_TIME) {
+      mode = MODE_IDLE;
+      Serial.println("Button 3 — back to idle");
+    }  // in break: button 3 does nothing
+  }
 }
 
 // Log WiFi connect/disconnect transitions without blocking startup.
@@ -680,6 +854,7 @@ void setup() {
   app.onRepeat(SYNC_POLL_INTERVAL, pollSyncResponse);
   app.onRepeat(ALERT_BLINK_INTERVAL, blinkAlertLed);
   app.onRepeat(SUPPRESS_POLL_INTERVAL, checkSuppressButton);
+  app.onRepeat(SUPPRESS_POLL_INTERVAL, checkModeButtons);
   app.onRepeat(WIFI_MONITOR_INTERVAL, monitorWiFi);
 }
 
