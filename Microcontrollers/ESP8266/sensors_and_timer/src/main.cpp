@@ -38,7 +38,7 @@ const char* serverPath = "/api/esp8266-sync";
 
 #define POT_PIN A0        //          — potentiometer wiper (ESP8266's own ADC)
 #define ADS_LDR_CHANNEL 0 // ADS1115 AIN0 — LDR divider (16-bit analog over I2C)
-#define LDR_DARK_THRESHOLD 5000  // ldrValue below this = "dark" (tune to your lighting)
+#define LDR_DARK_THRESHOLD 2000  // ldrValue below this = "dark" (tune to your lighting)
 
 // Push buttons read via spare ADS1115 channels (all ESP GPIOs are used). Each
 // button ties its AINx to 3V3 when pressed, a pull-down holds it near 0 V;
@@ -53,6 +53,7 @@ const char* serverPath = "/api/esp8266-sync";
 // SD folder "01" (= your distracted sounds, files 001.mp3, 002.mp3, ...).
 #define DFPLAYER_VOLUME 10         // 0..30 — moderate on purpose: high volume clips a
                                    // small speaker and spikes current (distortion/cutout)
+#define EXTRA_VOLUME 8            // 0..30 — volume just for folder 06 (button 2); tune to taste
 #define DISTRACTED_FOLDER 1        // 01: nag sounds while distracted during focus
 #define BREAK_END_FOLDER 2         // 02: last 2 s of break (focus about to start)
 #define MISS_FOLDER 3              // 03: break start, did NOT beat the best distracted time
@@ -62,11 +63,11 @@ const char* serverPath = "/api/esp8266-sync";
 // Number of NNN.mp3 files in each folder — set these to your real file counts.
 // (Picking a random track above the count would play silence.)
 #define NUM_DISTRACTED_TRACKS 11
-#define NUM_BREAK_END_TRACKS 1
-#define NUM_MISS_TRACKS 1
-#define NUM_BEAT_TRACKS 1
-#define NUM_DARK_TRACKS 1
-#define NUM_EXTRA_TRACKS 1
+#define NUM_BREAK_END_TRACKS 4
+#define NUM_MISS_TRACKS 4
+#define NUM_BEAT_TRACKS 5
+#define NUM_DARK_TRACKS 3
+#define NUM_EXTRA_TRACKS 11
 #define BLINK_CYCLES 2             // LED blinks this many distracted cycles, then audio fires
 #define SUPPRESS_CYCLES 2          // a button press mutes the LED for this many cycles first
 #define REPEAT_AUDIO_CYCLES 4      // after the first audio, re-play every this many distracted cycles
@@ -406,9 +407,18 @@ void updateLeds() {
   digitalWrite(LED_GREEN_PIN, green ? HIGH : LOW);
 }
 
-// Play a random NNN.mp3 (1..numTracks) from the given SD folder.
+// Play a random NNN.mp3 (1..numTracks) from the given SD folder. Folder 06 plays
+// at EXTRA_VOLUME, everything else at DFPLAYER_VOLUME. The DFPlayer volume is a
+// single global setting, so we switch it only when it actually needs to change.
+uint8_t currentVolume = DFPLAYER_VOLUME;
 void playRandomFromFolder(uint8_t folder, uint8_t numTracks) {
   if (!dfReady) return;
+  uint8_t wantVol = (folder == EXTRA_FOLDER) ? EXTRA_VOLUME : DFPLAYER_VOLUME;
+  if (wantVol != currentVolume) {
+    dfplayer.volume(wantVol);
+    currentVolume = wantVol;
+    delay(30);  // let the module apply the new volume before the play command
+  }
   dfplayer.playFolder(folder, random(1, numTracks + 1));
 }
 
