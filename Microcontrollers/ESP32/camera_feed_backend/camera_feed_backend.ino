@@ -27,6 +27,20 @@ const char* serverUrl = "http://192.168.137.201:8000/api/predict";
 // Camera status variable
 bool camera_status = false;
 
+// Capture-indicator LED: stays lit for the whole capture-and-upload, so the user
+// can see when an image is being taken. External LED on D10/GPIO9 (D9/GPIO8 or
+// D8/GPIO7 work too): GPIO -> ~220 ohm -> LED anode, cathode -> GND.
+#define CAPTURE_LED_PIN 9            // D10 / GPIO9
+#define CAPTURE_LED_ACTIVE_LOW 0     // external LED to GND = active-HIGH
+
+void setCaptureLed(bool on) {
+#if CAPTURE_LED_ACTIVE_LOW
+  digitalWrite(CAPTURE_LED_PIN, on ? LOW : HIGH);
+#else
+  digitalWrite(CAPTURE_LED_PIN, on ? HIGH : LOW);
+#endif
+}
+
 // Camera Parameters for setup
 void CameraParameters() {
   // Define camera parameters
@@ -88,7 +102,11 @@ void CameraParameters() {
 void setup() {
   // Start Serial Monitor, wait until port is ready
   Serial.begin(115200);
-  
+
+  // Capture-indicator LED
+  pinMode(CAPTURE_LED_PIN, OUTPUT);
+  setCaptureLed(false);
+
   // Connect WiFi
   WiFi.begin(ssid, password);
 
@@ -114,9 +132,12 @@ void loop() {
   if (camera_status) {
     char imageFileName[32];
 
+    setCaptureLed(true);                 // on for the whole capture + upload
     camera_fb_t *fb = esp_camera_fb_get();
+
     if (!fb) {
       Serial.println("Failed to get camera frame buffer");
+      setCaptureLed(false);
       return;
     }
     Serial.printf("Image captured: %d bytes\n", fb->len);
@@ -154,6 +175,7 @@ void loop() {
 
     // Release image buffer
     esp_camera_fb_return(fb);
+    setCaptureLed(false);                // capture + upload done
   }
-    delay(5000);
+    delay(4500);
 }
