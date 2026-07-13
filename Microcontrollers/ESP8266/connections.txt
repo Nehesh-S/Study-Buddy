@@ -52,3 +52,13 @@ Traffic-light LEDs:
 
 Alert LED (blue) -- blinks when backend reports "distracted" or "away":
     BLUE   -> D3   (GPIO0)
+
+DFPlayer Mini (mini MP3 module):
+    VCC  -> 5V (VU/VIN)   // onboard amp is weak at 3.3V; 5V is louder
+    GND  -> GND
+    RX   -> TX (GPIO1)    // ESP transmits commands;
+    TX   -> leave UNCONNECTED
+             // We only send commands. Do NOT wire module-TX -> ESP-RX while the
+             // module runs at 5V: its 5V TX would over-drive the ESP's 3.3V RX.
+    SPK1 -> speaker +
+    SPK2 -> speaker -

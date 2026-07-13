@@ -7,6 +7,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_ADS1X15.h>
+#include <DFRobotDFPlayerMini.h>
 #include <ReactESP.h>
 
 using namespace reactesp;
@@ -38,6 +39,16 @@ const char* serverPath = "/api/esp8266-sync";
 // otherwise; anything above the threshold counts as pressed.
 #define ADS_BUTTON_CHANNEL 1
 #define BUTTON_PRESS_THRESHOLD 10000  // ~1.25 V at GAIN_ONE (idle ~0, pressed ~26000)
+
+// DFPlayer Mini (mini MP3 module) on the hardware UART. Escalation: if a
+// distraction outlasts the blink/grace period, play a random track from the
+// SD folder "01" (= your distracted sounds, files 001.mp3, 002.mp3, ...).
+#define DFPLAYER_VOLUME 12         // 0..30 — moderate on purpose: high volume clips a
+                                   // small speaker and spikes current (distortion/cutout)
+#define DISTRACTED_FOLDER 1        // SD card folder "01"
+#define NUM_DISTRACTED_TRACKS 11    // set to how many NNN.mp3 files are in folder 01
+#define AUDIO_ESCALATE_CYCLES 2    // play audio once distraction lasts beyond this many cycles
+#define SUPPRESS_CYCLES 2          // button mutes the blue LED for this many alert cycles
 
 #define TOUCH1_PIN 13 //D7  — start focus timer / stop the cycle
 #define TOUCH2_PIN 12 //D6  — cycle set mode (focus -> break -> idle)
@@ -87,6 +98,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 DHT dht(DHTPIN, DHTTYPE);
 Adafruit_ADS1115 ads;   // external 16-bit ADC on the shared I2C bus (addr 0x48)
 bool adsReady = false;  // set true once ads.begin() succeeds
+DFRobotDFPlayerMini dfplayer;  // mini MP3 module on the hardware UART (Serial)
+bool dfReady = false;
 
 ReactESP app;  // ReactESP 2.x — v3 dropped ESP8266 support (requires FreeRTOS)
 
@@ -101,9 +114,12 @@ String syncResponse;  // accumulates the full HTTP reply as bytes trickle in
 // blue LED blinks; false on "working". Consumed by blinkAlertLed().
 bool alertActive = false;
 
-// Suppress button: when pressed, mutes the blue blink for the current alert
-// window. Cleared by each fresh distracted/away reply, so the blink returns.
-bool alertSuppressed = false;
+// Suppress button: a press mutes the blue blink for SUPPRESS_CYCLES alert
+// cycles. distractedCycles counts consecutive "distracted" replies (for the
+// audio escalation); audioPlayed keeps the track from replaying every cycle.
+int suppressCyclesLeft = 0;
+int distractedCycles = 0;
+bool audioPlayed = false;
 bool buttonWasPressed = false;  // for rising-edge detection on the ADS button
 
 // Tracks WiFi connection state so we can log transitions without blocking.
@@ -169,6 +185,9 @@ void startFocusPhase() {
   phaseStartMillis = millis();
   timerPaused = false;
   alertActive = false;
+  suppressCyclesLeft = 0;
+  distractedCycles = 0;
+  audioPlayed = false;
 }
 
 // Map the potentiometer to a whole number of minutes in [MIN, MAX].
@@ -424,6 +443,13 @@ void syncToServer() {
   touchDetected = false;  // request is on its way
 }
 
+// Play a random track from the distracted-sounds folder on the DFPlayer's SD.
+void playDistractedAudio() {
+  if (!dfReady) return;
+  uint8_t track = random(1, NUM_DISTRACTED_TRACKS + 1);  // 1..NUM
+  dfplayer.playFolder(DISTRACTED_FOLDER, track);
+}
+
 // Parse the reply body and act on current_state ("working"/"distracted"/"away").
 // Only the focus phase cares about the camera state — break/idle ignore it.
 void handleSyncResponse() {
@@ -444,11 +470,32 @@ void handleSyncResponse() {
   }
 
   String state = (const char*)doc["current_state"];
-  alertActive = (state == "distracted" || state == "away");  // pauses + blinks blue
-  if (alertActive) alertSuppressed = false;  // a fresh alert re-arms the blink
+  bool distracted = (state == "distracted");
+  alertActive = distracted || (state == "away");  // both pause + blink blue
+
+  if (!alertActive) {
+    // "working": clean slate for the next alert episode.
+    distractedCycles = 0;
+    suppressCyclesLeft = 0;
+    audioPlayed = false;
+  } else {
+    if (suppressCyclesLeft > 0) suppressCyclesLeft--;  // consume one muted cycle
+    if (distracted) {
+      distractedCycles++;
+      // Escalate to sound once distraction outlasts the grace cycles.
+      if (distractedCycles > AUDIO_ESCALATE_CYCLES && !audioPlayed) {
+        playDistractedAudio();
+        audioPlayed = true;
+      }
+    } else {
+      distractedCycles = 0;  // "away" breaks the distracted streak (no audio)
+      audioPlayed = false;
+    }
+  }
+
   Serial.print("current_state: ");
   Serial.print(state);
-  Serial.println(alertActive ? "  -> ALERT (focus paused, blue blinking)" : "  -> working");
+  Serial.println(alertActive ? "  -> ALERT" : "  -> working");
 }
 
 // Non-blocking reply handler: reads only bytes already available, so it never
@@ -478,7 +525,7 @@ void pollSyncResponse() {
 // suppress button has muted it for this window; off otherwise.
 void blinkAlertLed() {
   static bool on = false;
-  if (!(alertActive && mode == MODE_FOCUS && !alertSuppressed)) {
+  if (!(alertActive && mode == MODE_FOCUS && suppressCyclesLeft == 0)) {
     on = false;
     digitalWrite(LED_BLUE_PIN, LOW);
     return;
@@ -494,8 +541,8 @@ void checkSuppressButton() {
   if (!adsReady) return;
   bool pressed = ads.readADC_SingleEnded(ADS_BUTTON_CHANNEL) > BUTTON_PRESS_THRESHOLD;
   if (pressed && !buttonWasPressed) {  // rising edge = new press
-    alertSuppressed = true;
-    Serial.println("Suppress button — blue blink muted for this window");
+    suppressCyclesLeft = SUPPRESS_CYCLES;
+    Serial.println("Suppress button — blue blink muted for 2 cycles");
   }
   buttonWasPressed = pressed;
 }
@@ -517,12 +564,15 @@ void monitorWiFi() {
 // --------------------------------------------------------------------------
 
 void setup() {
-  Serial.begin(115200);
+  // The hardware UART now drives the DFPlayer Mini (9600 baud, fixed), so the
+  // USB serial monitor is no longer usable — debug prints still go out but are
+  // ignored by the module (they contain no 0x7E frame-start byte).
+  Serial.begin(9600);
 
-  // DIAGNOSTIC: why did we just (re)boot? "Exception"/"Software Watchdog" point
-  // at a code fault; "External System"/"Power on" is a normal/manual reset.
-  Serial.print("\n\nReset reason: ");
-  Serial.println(ESP.getResetReason());
+  // Command-only link to the MP3 module (isACK=false: we don't read its replies).
+  dfReady = dfplayer.begin(Serial, false, false);
+  dfplayer.volume(DFPLAYER_VOLUME);
+  randomSeed(micros());
 
   dht.begin();
 
