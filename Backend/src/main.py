@@ -19,8 +19,6 @@ latest_yolo_state = "working"
 global_timer_value = 0
 current_streak = 0.0
 last_predict_time = time.time()
-timer_last_changed = time.time()
-last_timer_value = -1
 
 class SensorData(BaseModel):
     humidity: float
@@ -31,7 +29,7 @@ class SensorData(BaseModel):
 
 @app.post("/api/predict")
 async def predict(request: Request):
-    global latest_yolo_state, global_timer_value, current_streak, last_predict_time, timer_last_changed
+    global latest_yolo_state, global_timer_value, current_streak, last_predict_time
 
     now = time.time()
     delta = now - last_predict_time
@@ -72,20 +70,13 @@ async def predict(request: Request):
         else:
             latest_yolo_state = "away" # No person detected
             
-        # The simulator sends data every 5 seconds, real hardware might be faster.
-        # If timer hasn't changed in 7 seconds, assume it is paused.
-        is_timer_running = (global_timer_value > 0) and ((time.time() - timer_last_changed) < 7.0)
-
-        if is_timer_running:
+        if global_timer_value > 0:
             if latest_yolo_state == "working":
                 current_streak += delta
             else:
                 current_streak = 0.0
         else:
-            if latest_yolo_state != "working":
-                latest_yolo_state = f"{latest_yolo_state} (break)"
-            else:
-                latest_yolo_state = "working (break)"
+            current_streak = 0.0
             
         # Save the YOLO annotated image
         output_filename = "latest_detection.jpg"
@@ -140,12 +131,8 @@ async def predict(request: Request):
 
 @app.post("/api/esp8266-sync")
 async def esp8266_sync(data: SensorData):
-    global latest_yolo_state, global_timer_value, timer_last_changed, last_timer_value
+    global latest_yolo_state, global_timer_value
     
-    if data.timer_value != last_timer_value:
-        timer_last_changed = time.time()
-        last_timer_value = data.timer_value
-        
     global_timer_value = data.timer_value
     
     client = InfluxDBClient(
