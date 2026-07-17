@@ -4,6 +4,7 @@ import csv
 from datetime import datetime
 import requests
 import threading
+import argparse
 
 ESP8266_URL = "http://localhost:8000/api/esp8266-sync"
 ESP32_URL = "http://localhost:8000/api/predict"
@@ -20,9 +21,9 @@ def log_event(device, status, details):
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), device, status, details])
     print(f"[{device}] {status}: {details}")
 
-def simulate_esp8266():
-    timer_seconds = 0
-    timer_running = False
+def simulate_esp8266(test_break=False):
+    timer_seconds = 20 if test_break else 0
+    timer_running = test_break
     
     BASE_HUMIDITY = 45.0
     BASE_TEMP = 22.0
@@ -32,7 +33,7 @@ def simulate_esp8266():
         button_pressed = False
         
         # Simulate button press to start the 5-min timer
-        if not timer_running and random.random() < 0.5: # 50% chance every 5s to hit the button if idle
+        if not test_break and not timer_running and random.random() < 0.5: # 50% chance every 5s to hit the button if idle
             timer_running = True
             timer_seconds = 300
             button_pressed = True
@@ -61,7 +62,7 @@ def simulate_esp8266():
 import os
 import glob
 
-def simulate_esp32():
+def simulate_esp32(test_break=False):
     cycle_count = 0
     current_image_idx = 0
     
@@ -72,9 +73,13 @@ def simulate_esp32():
             image_data = b'\xff\xd8\xff\xe0\x00\x10JFIFdummy'
             
             if images:
-                if cycle_count >= 5:
-                    cycle_count = 0
-                    current_image_idx = (current_image_idx + 1) % len(images)
+                if test_break:
+                    # Stick to the second image (assumed to be working) to build a streak
+                    current_image_idx = 1 if len(images) > 1 else 0
+                else:
+                    if cycle_count >= 5:
+                        cycle_count = 0
+                        current_image_idx = (current_image_idx + 1) % len(images)
                     
                 selected_image = images[current_image_idx]
                 with open(selected_image, 'rb') as f:
@@ -100,11 +105,17 @@ def simulate_esp32():
         time.sleep(5)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test-break", action="store_true", help="Start with a quick 20s timer to simulate a study phase ending and transitioning to a break")
+    args = parser.parse_args()
+
     print("Starting Hardware Simulation (ESP8266 & ESP32)...")
+    if args.test_break:
+        print("--- TEST BREAK MODE ACTIVE: Starting with 20s timer ---")
     print("Press Ctrl+C to stop.")
     
-    t1 = threading.Thread(target=simulate_esp8266, daemon=True)
-    t2 = threading.Thread(target=simulate_esp32, daemon=True)
+    t1 = threading.Thread(target=simulate_esp8266, args=(args.test_break,), daemon=True)
+    t2 = threading.Thread(target=simulate_esp32, args=(args.test_break,), daemon=True)
     
     t1.start()
     t2.start()

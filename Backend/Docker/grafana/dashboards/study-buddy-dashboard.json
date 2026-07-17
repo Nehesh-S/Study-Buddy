@@ -292,6 +292,21 @@
                   "text": "Away",
                   "color": "yellow",
                   "index": 2
+                },
+                "3": {
+                  "text": "Working (break)",
+                  "color": "blue",
+                  "index": 3
+                },
+                "4": {
+                  "text": "Distracted (break)",
+                  "color": "blue",
+                  "index": 4
+                },
+                "5": {
+                  "text": "Away (break)",
+                  "color": "blue",
+                  "index": 5
                 }
               }
             }
@@ -416,6 +431,21 @@
                   "text": "Away",
                   "color": "yellow",
                   "index": 2
+                },
+                "3": {
+                  "text": "Working (break)",
+                  "color": "blue",
+                  "index": 3
+                },
+                "4": {
+                  "text": "Distracted (break)",
+                  "color": "blue",
+                  "index": 4
+                },
+                "5": {
+                  "text": "Away (break)",
+                  "color": "blue",
+                  "index": 5
                 }
               }
             }
@@ -452,7 +482,7 @@
             "type": "influxdb",
             "uid": "InfluxDB"
           },
-          "query": "from(bucket: \"sensors\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r[\"_measurement\"] == \"camera\")\n  |> filter(fn: (r) => r[\"_field\"] == \"state_code\")\n  |> group(columns: [\"_value\"])\n  |> reduce(fn: (r, accumulator) => ({ count: accumulator.count + 1 }), identity: {count: 0})\n  |> map(fn: (r) => ({ _field: if r._value == 0 then \"Distracted\" else if r._value == 1 then \"Working\" else \"Away\", _value: r.count }))\n  |> group(columns: [\"_field\"])",
+          "query": "from(bucket: \"sensors\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r[\"_measurement\"] == \"camera\")\n  |> filter(fn: (r) => r[\"_field\"] == \"state_code\")\n  |> group(columns: [\"_value\"])\n  |> reduce(fn: (r, accumulator) => ({ count: accumulator.count + 1 }), identity: {count: 0})\n  |> map(fn: (r) => ({ _field: if r._value == 0 then \"Distracted\" else if r._value == 1 then \"Working\" else if r._value == 2 then \"Away\" else if r._value == 3 then \"Working (break)\" else if r._value == 4 then \"Distracted (break)\" else \"Away (break)\", _value: r.count }))\n  |> group(columns: [\"_field\"])",
           "refId": "A"
         }
       ],
@@ -531,6 +561,51 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Working (break)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Distracted (break)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Away (break)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
@@ -538,167 +613,68 @@
         {
           "id": "renameByRegex",
           "options": {
-            "regex": ".*(Distracted|Working|Away).*",
+            "regex": ".*(Working \\(break\\)|Distracted \\(break\\)|Away \\(break\\)|Distracted|Working|Away).*",
             "renamePattern": "$1"
           }
         }
       ]
     },
     {
-      "id": 12,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "InfluxDB"
+      },
       "gridPos": {
         "h": 10,
         "w": 14,
         "x": 10,
         "y": 14
       },
-      "type": "timeseries",
-      "title": "Environmental Distraction Correlation",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "InfluxDB"
-      },
+      "id": 13,
+      "title": "Study Streak (Current)",
+      "type": "stat",
       "targets": [
         {
           "datasource": {
             "type": "influxdb",
             "uid": "InfluxDB"
           },
-          "query": "from(bucket: \"sensors\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r[\"_measurement\"] == \"camera\")\n  |> filter(fn: (r) => r[\"_field\"] == \"state_code\")\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> map(fn: (r) => ({ r with _value: if r._value == 0 then 1 else if r._value == 1 then 3 else 2 }))\n  |> yield(name: \"State\")",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "InfluxDB"
-          },
-          "query": "from(bucket: \"sensors\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r[\"_measurement\"] == \"camera\")\n  |> filter(fn: (r) => r[\"_field\"] == \"noise_db\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"Noise\")",
-          "refId": "A"
+          "query": "from(bucket: \"sensors\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r[\"_measurement\"] == \"camera\") |> filter(fn: (r) => r[\"_field\"] == \"current_streak\") |> last()"
         }
       ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "thresholds"
           },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 15
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/.*state_code.*/"
-            },
-            "properties": [
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
               {
-                "id": "custom.axisPlacement",
-                "value": "right"
+                "color": "red",
+                "value": null
               },
               {
-                "id": "custom.drawStyle",
-                "value": "bars"
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 30
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 0
-              },
-              {
-                "id": "min",
-                "value": 0
-              },
-              {
-                "id": "max",
-                "value": 3.5
-              },
-              {
-                "id": "color",
-                "value": {
-                  "mode": "thresholds"
-                }
-              },
-              {
-                "id": "custom.gradientMode",
-                "value": "none"
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "red",
-                      "value": null
-                    },
-                    {
-                      "color": "yellow",
-                      "value": 2
-                    },
-                    {
-                      "color": "green",
-                      "value": 3
-                    }
-                  ]
-                }
-              },
-              {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "1": {
-                        "text": "Distracted",
-                        "color": "red",
-                        "index": 0
-                      },
-                      "2": {
-                        "text": "Away",
-                        "color": "yellow",
-                        "index": 1
-                      },
-                      "3": {
-                        "text": "Working",
-                        "color": "green",
-                        "index": 2
-                      }
-                    }
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/.*noise_db.*/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "super-light-blue",
-                  "mode": "fixed"
-                }
-              },
-              {
-                "id": "custom.drawStyle",
-                "value": "line"
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 2
+                "color": "super-light-blue",
+                "value": 1
               }
             ]
           }
-        ]
+        }
       }
     }
   ],

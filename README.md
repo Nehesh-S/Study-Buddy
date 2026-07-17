@@ -6,23 +6,45 @@ The **Study Buddy** is an IoT-based productivity and focus monitoring system. It
 
 ## 1. Setup & Execution
 
-### Prerequisites
-* [Docker Desktop](https://www.docker.com/products/docker-desktop/) and Docker Compose
-* Python 3.10+ and [uv](https://github.com/astral-sh/uv) (for running the local simulator)
+If you are new to Docker or backend development, follow these step-by-step instructions to get the system running.
 
-### 1. Start the Databases (Docker)
-To keep things clean, we run InfluxDB and Grafana inside Docker containers:
+### Prerequisites
+
+1. **Install Docker Desktop**: This is required to run our database and dashboard containers. 
+   - Download it from [Docker's official website](https://www.docker.com/products/docker-desktop/).
+   - Install and launch the application. Ensure the Docker engine is running (you should see a green whale icon in your system tray or menu bar).
+2. **Install Python & uv**: 
+   - Ensure you have **Python 3.10+** installed.
+   - Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (an extremely fast Python package installer and resolver).
+
+### Step 1: Create and Start the Database Containers (Docker)
+
+To keep our system clean and avoid installing databases directly on your machine, we run InfluxDB (for data storage) and Grafana (for dashboards) inside Docker containers.
+
+Open your terminal and navigate to the Docker folder:
 ```bash
 cd Backend/Docker
-docker-compose up -d influxdb grafana
 ```
 
-### 2. Start the AI Backend (Native)
-To squeeze maximum performance out of your Apple Silicon or local GPU for the heavy YOLOv8 Large model, run the backend natively outside of Docker:
+Run the following command to download the necessary images and start the containers in the background (`-d` means detached mode):
+```bash
+docker-compose up -d influxdb grafana
+```
+*(Note: The first time you run this, it may take a few minutes to download the container images).*
+
+### Step 2: Start the AI Inference Backend (Native)
+
+Open a **new** terminal window (or PowerShell/Command Prompt on Windows), navigate to the Backend folder, and start the server using `uv`:
 ```bash
 cd Backend
 uv run uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
+*(`uv run` will automatically install any missing dependencies defined in the project before starting the server).*
+
+> [!NOTE]
+> **Windows Users:** The commands above work exactly the same in PowerShell or Command Prompt. 
+> 
+> **Running without a GPU:** If your computer (Windows, Mac, or Linux) does not have a dedicated GPU (or lacks the proper CUDA drivers), the YOLOv8 model will automatically fall back to running on your CPU. The system will still work perfectly fine, but processing each image will take longer (higher latency) and consume more CPU resources.
 
 ### 3. Run the Hardware Simulator
 If you don't have physical hardware, run the Python simulator to send mocked sensor data and camera images to the backend:

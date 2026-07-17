@@ -27,6 +27,8 @@ keep `serverPort` = 8000.
 import json
 import socket
 import threading
+import time
+import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "0.0.0.0"
@@ -138,6 +140,10 @@ def keyboard_loop(server: ThreadingHTTPServer) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Study-Buddy backend simulator")
+    parser.add_argument("--auto", action="store_true", help="Automatically cycle between working (30s) and away (10s) to simulate a study phase and break.")
+    args = parser.parse_args()
+
     server = ThreadingHTTPServer((HOST, PORT), SyncHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -145,6 +151,17 @@ def main() -> None:
     print(f"Study-Buddy backend simulator listening on http://{local_ip()}:{PORT}{PATH}")
     print(f"  -> set the firmware's serverHost = \"{local_ip()}\" (serverPort = {PORT})")
     print(f"  -> default current_state = \"{get_state()}\"")
+    
+    if args.auto:
+        print("  -> AUTO MODE: Will automatically cycle states (30s working, 10s away).")
+        def auto_cycle():
+            while True:
+                set_state("working")
+                time.sleep(30)
+                set_state("away")
+                time.sleep(10)
+        threading.Thread(target=auto_cycle, daemon=True).start()
+
     try:
         keyboard_loop(server)
     except KeyboardInterrupt:

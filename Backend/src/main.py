@@ -16,6 +16,11 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 model = YOLO("yolov8l.pt")
 latest_yolo_state = "working"
+global_timer_value = 0
+current_streak = 0.0
+last_predict_time = time.time()
+timer_last_changed = time.time()
+last_timer_value = -1
 
 class SensorData(BaseModel):
     humidity: float
@@ -26,7 +31,11 @@ class SensorData(BaseModel):
 
 @app.post("/api/predict")
 async def predict(request: Request):
-    global latest_yolo_state
+    global latest_yolo_state, global_timer_value, current_streak, last_predict_time, timer_last_changed
+
+    now = time.time()
+    delta = now - last_predict_time
+    last_predict_time = now
 
     # 1. Grab the decibel value from the headers (defaults to 0 if missing)
     noise_str = request.headers.get("Noise-Level", "0")
@@ -63,6 +72,21 @@ async def predict(request: Request):
         else:
             latest_yolo_state = "away" # No person detected
             
+        # The simulator sends data every 5 seconds, real hardware might be faster.
+        # If timer hasn't changed in 7 seconds, assume it is paused.
+        is_timer_running = (global_timer_value > 0) and ((time.time() - timer_last_changed) < 7.0)
+
+        if is_timer_running:
+            if latest_yolo_state == "working":
+                current_streak += delta
+            else:
+                current_streak = 0.0
+        else:
+            if latest_yolo_state != "working":
+                latest_yolo_state = f"{latest_yolo_state} (break)"
+            else:
+                latest_yolo_state = "working (break)"
+            
         # Save the YOLO annotated image
         output_filename = "latest_detection.jpg"
         output_path = os.path.join(STATIC_DIR, output_filename)
@@ -80,14 +104,27 @@ async def predict(request: Request):
         ts = int(time.time())
         image_url = f"http://localhost:8000/static/{output_filename}?ts={ts}"
         
-        # Map states to integers: 1 (Working), 0 (Distracted), 2 (Away)
-        state_int = 1 if latest_yolo_state == "working" else (0 if latest_yolo_state == "distracted" else 2)
+        if latest_yolo_state == "working":
+            state_int = 1
+        elif latest_yolo_state == "distracted":
+            state_int = 0
+        elif latest_yolo_state == "away":
+            state_int = 2
+        elif latest_yolo_state == "working (break)":
+            state_int = 3
+        elif latest_yolo_state == "distracted (break)":
+            state_int = 4
+        elif latest_yolo_state == "away (break)":
+            state_int = 5
+        else:
+            state_int = 6
         
         point = Point("camera") \
             .field("image_url", image_url) \
             .field("state", latest_yolo_state) \
             .field("state_code", state_int) \
-            .field("noise_db", noise_db)
+            .field("noise_db", noise_db) \
+            .field("current_streak", int(current_streak))
             
         write_api.write(bucket="sensors", org="myorg", record=point)
         client.close()
@@ -103,7 +140,13 @@ async def predict(request: Request):
 
 @app.post("/api/esp8266-sync")
 async def esp8266_sync(data: SensorData):
-    global latest_yolo_state
+    global latest_yolo_state, global_timer_value, timer_last_changed, last_timer_value
+    
+    if data.timer_value != last_timer_value:
+        timer_last_changed = time.time()
+        last_timer_value = data.timer_value
+        
+    global_timer_value = data.timer_value
     
     client = InfluxDBClient(
         url="http://localhost:8086",
